@@ -4,6 +4,8 @@ This Shiny application fetches real-time stock data via **Yahoo Finance API**, p
 
 Check live predictions from just yesterday and the past few days for Apple, Amazon, Microsoft, Google, and Nvidia ([AAPL, AMZN, MSFT, GOOGL, NVDA]).
 
+P.S. No you won't be a trillionaire, I wish i was ...... employed '_T sorry if you really thought hard on that, didnt meant to trick you!
+
 # Live App (CLICK HERE): 
 ----------------------------------------------------------------------------------------------------------------------
 [https://sathyav99.shinyapps.io/API_US_stock_prediction/](https://sathyav99.shinyapps.io/API_US_stock_prediction/)
