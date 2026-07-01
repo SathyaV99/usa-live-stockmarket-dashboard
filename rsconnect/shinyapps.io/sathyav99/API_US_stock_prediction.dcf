@@ -1,0 +1,10 @@
+name: API_US_stock_prediction
+title:
+username: sathyav99
+account: sathyav99
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 11703649
+bundleId: 12205756
+url: https://sathyav99.shinyapps.io/API_US_stock_prediction/
+version: 1

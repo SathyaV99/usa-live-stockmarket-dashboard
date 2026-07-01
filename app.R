@@ -243,9 +243,9 @@ server <- function(input, output, session){
     stocks_data[[symbol]] <- latest_opening
   }
   
-  # Map the global selectInput to fetch data and refresh every 5 minutes (300,000 ms)
+  # Map the global selectInput to fetch data and refresh every 6 hours (21,600,000 ms)
   observe({ 
-    invalidateLater(300000, session)
+    invalidateLater(21600000, session)
     retrieveData(input$global_symbol) 
   })
   

@@ -1,89 +1,47 @@
 # API-Driven US Stock Market Prediction App
 
-This Shiny application fetches real-time stock data via **Yahoo Finance API**, performs **feature engineering**, and applies a **linear regression model** to predict the closing price of top US stocks: **AAPL, AMZN, MSFT, GOOGL, and NVDA**.
+This Shiny application fetches real-time stock data via the **Yahoo Finance API**, performs **feature engineering**, and applies an advanced **XGBoost machine learning model** to predict the closing price of top US stocks (AAPL, AMZN, MSFT, GOOGL, NVDA) for the **next trading day**.
 
-Check live predictions from just yesterday and the past few days for Apple, Amazon, Microsoft, Google, and Nvidia ([AAPL, AMZN, MSFT, GOOGL, NVDA]).
+It also simulates a live trading strategy, tracks cumulative profit, and permanently logs predictions to a secure **Supabase PostgreSQL cloud database**.
 
-
-# Live App (CLICK HERE): 
 ----------------------------------------------------------------------------------------------------------------------
+# Live App (CLICK HERE): 
 [https://sathyav99.shinyapps.io/API_US_stock_prediction/](https://sathyav99.shinyapps.io/API_US_stock_prediction/)
 ----------------------------------------------------------------------------------------------------------------------
+
 ---
 
 ## Key Features
 
-The app is divided into four tabs:
+The app is a highly focused, **Single-Page Dashboard** containing the following core elements:
 
-### 1. Home Tab  
-- Provides a brief intro.
-- Walkthrough on how the app works.
-- Explains how the model predicts using API and pretrained weights.
+### 1. Live Trading Metrics (Value Boxes)
+The dashboard continuously backtests the model's predictions over the last 30 days and dynamically calculates:
+- **30-Day Cumulative Profit**: Simulates a Long/Short strategy based on the model's signals (Buy if Up, Short if Down).
+- **Accurate vs Inaccurate**: A strict count of how many times the model correctly predicted the market's direction.
 
----
+### 2. Interactive Charts
+- **Prediction Chart (5 Days)**: A line chart comparing the actual close prices to the model's predicted close prices, complete with explicit **UP** and **DOWN** prediction markers.
+- **Macro Trend Chart (60 Days)**: A classic Candlestick chart (Open, High, Low, Close) to provide visual context on the recent momentum leading up to the predictions.
 
-### 2. Data Tab  
-Lets users explore **historical datasets**.
-
-- `Dataset`: View raw stock data (Open, Close, Volume, etc.).
-- `Summary`: Get statistics (mean, median, standard deviation, etc.).
-- `Structure`: See the structure (columns, data types).
-
-Supports: `AAPL`, `AMZN`, `GOOGL`, `NVDA`, `MSFT`
-
----
-
-### 3. Visualization Tab  
-Visualize stock behavior over the **last 30 days** using:
-
-- `Histogram`: Volume distribution  
-- `Boxplot`: Closing price spread  
-- `LineGraph`: Trend over time  
-- `ScatterPlot`: Close price over dates  
+### 3. Historical Prediction Logs
+A dynamic data table that secretly connects to a **Supabase PostgreSQL** backend to fetch all historical predictions. 
+- Automatically calculates `Actual Return %`, `Daily Profit %`, and `Cum. Profit %`.
+- Fully filterable by custom Date Ranges.
+- Highlights accurate predictions with ✅ and inaccurate with ❌.
 
 ---
 
-### 4. Prediction Tab  
-- Runs linear regression predictions using recent data.
-- Predicts next 5 days' closing prices.
-- Shows comparison between **actual vs. predicted**.
-- Displays plot + table output.
+## How True Forecasting Works
 
----
+Unlike standard lagging models, this architecture is a true forecaster (predicting t+1):
 
-## How Prediction Works
-
-1. Fetch **60 days of stock data** using:
-
-```r
-getSymbols(symbol, src = "yahoo", from = Sys.Date()-60, to = Sys.Date())
-```
-
-2. Engineer features for regression:
-
-```r
-MA_seven     <- SMA(open, n = 7)
-MA_fourteen  <- SMA(open, n = 14)
-MA_twenty    <- SMA(open, n = 20)
-SD_seven     <- runSD(open, n = 7)
-SD_fourteen  <- runSD(open, n = 14)
-SD_twenty    <- runSD(open, n = 20)
-```
-
-3. Load pretrained model:
-
-```r
-re_LR_model <- readRDS(paste0(symbol, "_LR.rds"))
-```
-
-4. Update model with latest 30-day data and predict last 5 days:
-
-```r
-retrained_model <- update(re_LR_model, data = last_30_days)
-predicted_close <- predict(retrained_model, newdata = tail(latest_opening, 5))
-```
-
-5. Display output in a **plotly line chart** and **data table**.
+1. **Live Data**: Fetch 90 days of live stock data using `quantmod::getSymbols`.
+2. **Feature Engineering**: Calculate 7, 14, and 20-day Moving Averages and Standard Deviations based on the Opening price.
+3. **Time-Shifting**: Align "Today's" features with "Tomorrow's" Target Close. 
+4. **Strict Constraint**: The XGBoost model (`_XGB.rds`) is trained *strictly* on a rolling 30-day window to capture only the most recent market regime.
+5. **Inference**: Pass today's live data into the model to predict **Tomorrow's Close**.
+6. **Cloud Sync**: Append the generated prediction for tomorrow to the Supabase database to track accuracy when tomorrow's actual price closes.
 
 ---
 
@@ -91,79 +49,31 @@ predicted_close <- predict(retrained_model, newdata = tail(latest_opening, 5))
 
 ```r
 library(shiny)
+library(shinydashboard)
 library(quantmod)
 library(TTR)
-library(datasets)
 library(plotly)
 library(ggplot2)
-library(shinythemes)
 library(dplyr)
 library(lubridate)
+library(xgboost)
+library(DBI)
+library(RPostgres)
 ```
 
 ---
 
-## Sync Across Tabs
+## Automated Deployment
 
-The selected stock symbol in any tab is synced across all tabs using:
-
-```r
-observe({
-  updateSelectInput(session, "dashboard_symbol", selected = input$symbol)
-  updateSelectInput(session, "stock_symbol", selected = input$symbol)
-  updateSelectInput(session, "symbol", selected = input$symbol)
-  retrieveData(input$symbol)
-})
-```
-
----
-
-## Yahoo Finance Link
-
-Each stock links directly to Yahoo Finance:
-
-```r
-tags$a(href = paste0("https://finance.yahoo.com/quote/", input$symbol),
-       icon("globe"), target="_blank")
-```
-
----
-
-## Visualization Preview
-
-### Example Boxplot (Last 30 Days)
-
-```r
-boxplot(stock_data_2$Close, col ='red',
-        main = "Boxplot of Closing Value for 30 days", 
-        ylab = "Close Value")
-```
-
-### Example LineGraph
-
-```r
-plot(stock_data_2$timestamp, stock_data_2$Close, 
-     type = "l", col = "red", main = "LineGraph")
-```
-
----
-
-## Model Strategy
-
-- Linear regression with selected features
-- Only last 30 days used to keep predictions fresh
-- Model updated at runtime with `update()` and new inputs
+Deploying the app to shinyapps.io is entirely automated for users without RStudio:
+- A `shinyapps_auth.R` file securely holds deployment credentials (git-ignored).
+- Double-clicking `deploy_dashboard.bat` automatically authenticates the machine, bundles the app, and pushes it to the live server.
 
 ---
 
 ## How to Run Locally
 
-1. Clone the repo  
-2. Place `*.csv` and `*.rds` model files in root  
-3. Run in RStudio or R console:
-
-```r
-shiny::runApp()
-```
-
----
+1. Clone the repository.
+2. Ensure you have the `_XGB.rds` models in the root folder.
+3. Create a `credentials.R` file with your Supabase database credentials.
+4. Double-click `run_dashboard.bat` to launch the app locally!
