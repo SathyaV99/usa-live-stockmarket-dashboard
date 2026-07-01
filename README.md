@@ -2,7 +2,7 @@
 
 This Shiny application fetches real-time stock data via the **Yahoo Finance API**, performs **feature engineering**, and applies an advanced **XGBoost machine learning model** to predict the closing price of top US stocks (AAPL, AMZN, MSFT, GOOGL, NVDA) for the **next trading day**.
 
-It also simulates a live trading strategy, tracks cumulative profit, and permanently logs predictions to a secure **Supabase PostgreSQL cloud database**.
+It also simulates a live trading strategy, tracks cumulative profit, and permanently logs predictions to a secure **Neon PostgreSQL cloud database**.
 
 ----------------------------------------------------------------------------------------------------------------------
 # Live App (CLICK HERE): 
@@ -25,7 +25,7 @@ The dashboard continuously backtests the model's predictions over the last 30 da
 - **Macro Trend Chart (60 Days)**: A classic Candlestick chart (Open, High, Low, Close) to provide visual context on the recent momentum leading up to the predictions.
 
 ### 3. Historical Prediction Logs
-A dynamic data table that secretly connects to a **Supabase PostgreSQL** backend to fetch all historical predictions. 
+A dynamic data table that secretly connects to a **Neon PostgreSQL** backend to fetch all historical predictions. 
 - Automatically calculates `Actual Return %`, `Daily Profit %`, and `Cum. Profit %`.
 - Fully filterable by custom Date Ranges.
 - Highlights accurate predictions with ✅ and inaccurate with ❌.
@@ -41,7 +41,7 @@ Unlike standard lagging models, this architecture is a true forecaster (predicti
 3. **Time-Shifting**: Align "Today's" features with "Tomorrow's" Target Close. 
 4. **Strict Constraint**: The XGBoost model (`_XGB.rds`) is trained *strictly* on a rolling 30-day window to capture only the most recent market regime.
 5. **Inference**: Pass today's live data into the model to predict **Tomorrow's Close**.
-6. **Cloud Sync**: Append the generated prediction for tomorrow to the Supabase database to track accuracy when tomorrow's actual price closes.
+6. **Cloud Sync**: Append the generated prediction for tomorrow to the Neon database to track accuracy when tomorrow's actual price closes.
 
 ---
 
@@ -75,5 +75,5 @@ Deploying the app to shinyapps.io is entirely automated for users without RStudi
 
 1. Clone the repository.
 2. Ensure you have the `_XGB.rds` models in the root folder.
-3. Create a `credentials.R` file with your Supabase database credentials.
+3. Create a `credentials.R` file with your Neon database credentials.
 4. Double-click `run_dashboard.bat` to launch the app locally!

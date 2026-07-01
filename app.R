@@ -75,14 +75,14 @@ server <- function(input, output, session){
   # Database connection helper
   get_db_connection <- function() {
     tryCatch({
-      DBI::dbConnect(
-        RPostgres::Postgres(),
-        host = SUPABASE_HOST,
-        port = SUPABASE_PORT,
-        dbname = SUPABASE_DBNAME,
-        user = SUPABASE_USER,
-        password = SUPABASE_PASSWORD
-      )
+      # Database Connection (Neon PostgreSQL)
+      con <- dbConnect(RPostgres::Postgres(),
+                       dbname = DB_NAME,
+                       host = DB_HOST,
+                       port = DB_PORT,
+                       user = DB_USER,
+                       password = DB_PASSWORD,
+                       sslmode = "require")
     }, error = function(e) { NULL })
   }
 
