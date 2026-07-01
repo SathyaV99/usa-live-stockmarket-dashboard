@@ -1,6 +1,0 @@
-@echo off
-echo Authenticating and Deploying Dashboard to shinyapps.io...
-echo Please wait, this might take a minute or two...
-"D:\R-4.6.1\bin\Rscript.exe" -e "if(!require(rsconnect)) install.packages('rsconnect', repos='http://cran.us.r-project.org'); source('shinyapps_auth.R'); rsconnect::deployApp('c:/Users/venka/Documents/usa-live-stockmarket-dashboard', forceUpdate = TRUE, appName = 'API_US_stock_prediction')"
-echo Deployment finished!
-pause

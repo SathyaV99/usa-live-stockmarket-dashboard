@@ -1,4 +1,4 @@
-source("credentials.R")
+source("../config/credentials.R")
 library(DBI)
 library(RPostgres)
 

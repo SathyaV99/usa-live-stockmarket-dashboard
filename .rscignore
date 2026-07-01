@@ -1,6 +1,9 @@
 # Files to ignore when deploying to Shinyapps.io
 .git
 .gitignore
-shinyapps_auth.R
-deploy_dashboard.bat
+config/shinyapps_auth.R
+deploy_cloud.bat
+start_local.bat
+scripts/
+data/
 README.md

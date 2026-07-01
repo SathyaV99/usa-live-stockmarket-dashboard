@@ -64,8 +64,8 @@ for (symbol in symbols) {
                        verbose = 0)
   
   # Save the model
-  saveRDS(xgb_model, paste0(symbol, "_XGB.rds"))
-  cat("Saved", paste0(symbol, "_XGB.rds"), "\n")
+  saveRDS(xgb_model, paste0("../models/", symbol, "_XGB.rds"))
+  cat("Saved", paste0("../models/", symbol, "_XGB.rds"), "\n")
 }
 
 cat("All models trained successfully.\n")
