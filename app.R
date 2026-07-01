@@ -27,6 +27,9 @@ ui <- dashboardPage(
     )
   ),
   dashboardBody(
+    # Dynamic Stock Header (Name, Price, Date)
+    uiOutput("stock_header"),
+    
     # Row for Metrics (Value Boxes)
     fluidRow(
       valueBoxOutput("profit_box", width = 4),
@@ -86,29 +89,7 @@ server <- function(input, output, session){
     }, error = function(e) { NULL })
   }
 
-  init_db <- function() {
-    con <- get_db_connection()
-    if (!is.null(con)) {
-      query <- "
-      CREATE TABLE IF NOT EXISTS predictions_log (
-        timestamp TEXT,
-        open NUMERIC,
-        close NUMERIC,
-        \"MA_seven\" NUMERIC,
-        \"MA_fourteen\" NUMERIC,
-        \"MA_twenty\" NUMERIC,
-        \"SD_seven\" NUMERIC,
-        \"SD_fourteen\" NUMERIC,
-        \"SD_twenty\" NUMERIC,
-        predicted_close NUMERIC,
-        \"Symbol\" TEXT
-      );
-      "
-      tryCatch({ DBI::dbExecute(con, query) }, error = function(e) { warning("Failed to initialize table: ", e$message) })
-      DBI::dbDisconnect(con)
-    }
-  }
-  init_db()
+
   
   # Create Function to update symbol data
   retrieveData <- function(symbol) {
@@ -218,23 +199,65 @@ server <- function(input, output, session){
       metrics_data$inaccurate <- inaccurate_count
     }
     
-    # Append the newly calculated FUTURE row to the cloud (Avoid duplicates)
+    # Upsert the entire 30-day block (and tomorrow's future prediction) to the cloud
     con <- get_db_connection()
     if (!is.null(con)) {
-      latest_opening$Symbol <- symbol
-      future_row_to_insert <- tail(latest_opening, 1)
+      table_name <- paste0(symbol, "_predictions")
       
-      check_query <- sprintf(
-        "SELECT COUNT(*) FROM predictions_log WHERE \"Symbol\" = '%s' AND timestamp = '%s'", 
-        symbol, future_row_to_insert$timestamp
-      )
+      # Ensure the table exists with timestamp as PRIMARY KEY for UPSERT support
+      query_create <- sprintf("
+        CREATE TABLE IF NOT EXISTS %s (
+          timestamp TEXT PRIMARY KEY,
+          open NUMERIC,
+          close NUMERIC,
+          \"MA_seven\" NUMERIC,
+          \"MA_fourteen\" NUMERIC,
+          \"MA_twenty\" NUMERIC,
+          \"SD_seven\" NUMERIC,
+          \"SD_fourteen\" NUMERIC,
+          \"SD_twenty\" NUMERIC,
+          predicted_close NUMERIC
+        );
+      ", table_name)
+      tryCatch({ DBI::dbExecute(con, query_create) }, error = function(e) {})
       
-      tryCatch({ 
-        count_res <- DBI::dbGetQuery(con, check_query)
-        if (count_res[[1]] == 0) {
-          DBI::dbAppendTable(con, "predictions_log", future_row_to_insert) 
-        }
-      }, error = function(e) {})
+      # UPSERT Loop
+      # We only UPSERT the last 3 days to avoid pointlessly overwriting the older 27 days 
+      # that haven't changed. This updates yesterday's NULL close and inserts tomorrow's prediction.
+      recent_opening <- tail(latest_opening, 3)
+      for(i in 1:nrow(recent_opening)) {
+        # Using COALESCE on predicted_close ensures we NEVER overwrite an older historical prediction
+        # with a new prediction, preserving the true historical backtest log perfectly!
+        query_upsert <- sprintf("
+          INSERT INTO %s (timestamp, open, close, \"MA_seven\", \"MA_fourteen\", \"MA_twenty\", \"SD_seven\", \"SD_fourteen\", \"SD_twenty\", predicted_close)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          ON CONFLICT (timestamp) DO UPDATE SET
+          open = EXCLUDED.open,
+          close = EXCLUDED.close,
+          \"MA_seven\" = EXCLUDED.\"MA_seven\",
+          \"MA_fourteen\" = EXCLUDED.\"MA_fourteen\",
+          \"MA_twenty\" = EXCLUDED.\"MA_twenty\",
+          \"SD_seven\" = EXCLUDED.\"SD_seven\",
+          \"SD_fourteen\" = EXCLUDED.\"SD_fourteen\",
+          \"SD_twenty\" = EXCLUDED.\"SD_twenty\",
+          predicted_close = COALESCE(%s.predicted_close, EXCLUDED.predicted_close);
+        ", table_name, table_name)
+        
+        tryCatch({
+          DBI::dbExecute(con, query_upsert, params = list(
+            recent_opening$timestamp[i],
+            ifelse(is.na(recent_opening$open[i]), NA, recent_opening$open[i]),
+            ifelse(is.na(recent_opening$close[i]), NA, recent_opening$close[i]),
+            ifelse(is.na(recent_opening$MA_seven[i]), NA, recent_opening$MA_seven[i]),
+            ifelse(is.na(recent_opening$MA_fourteen[i]), NA, recent_opening$MA_fourteen[i]),
+            ifelse(is.na(recent_opening$MA_twenty[i]), NA, recent_opening$MA_twenty[i]),
+            ifelse(is.na(recent_opening$SD_seven[i]), NA, recent_opening$SD_seven[i]),
+            ifelse(is.na(recent_opening$SD_fourteen[i]), NA, recent_opening$SD_fourteen[i]),
+            ifelse(is.na(recent_opening$SD_twenty[i]), NA, recent_opening$SD_twenty[i]),
+            ifelse(is.na(recent_opening$predicted_close[i]), NA, recent_opening$predicted_close[i])
+          ))
+        }, error = function(e) {})
+      }
       DBI::dbDisconnect(con)
     }
     
@@ -243,15 +266,41 @@ server <- function(input, output, session){
     stocks_data[[symbol]] <- latest_opening
   }
   
-  # Map the global selectInput to fetch data and refresh every 6 hours (21,600,000 ms)
+  # Map the global selectInput to fetch data and refresh every 12 hours (43,200,000 ms)
   observe({ 
-    invalidateLater(21600000, session)
+    invalidateLater(43200000, session)
     retrieveData(input$global_symbol) 
   })
   
   output$global_globe_link <- renderUI({
     tags$a(href = paste0("https://finance.yahoo.com/quote/", input$global_symbol),
            icon("globe"), target="_blank", style = "color: white;")
+  })
+  
+  # === STOCK HEADER UI ===
+  output$stock_header <- renderUI({
+    symbol <- input$global_symbol
+    stock_data <- stocks_data[[symbol]]
+    if(is.null(stock_data)) return()
+    
+    # Get the latest actual data (second to last row since last row is the future prediction)
+    latest_actual_row <- stock_data[nrow(stock_data) - 1, ]
+    latest_price <- round(latest_actual_row$close, 2)
+    latest_date <- latest_actual_row$timestamp
+    
+    company_names <- c(
+      "AAPL" = "Apple Inc.",
+      "AMZN" = "Amazon.com Inc.",
+      "NVDA" = "NVIDIA Corporation",
+      "GOOGL" = "Alphabet Inc.",
+      "MSFT" = "Microsoft Corporation"
+    )
+    company_name <- company_names[[symbol]]
+    
+    div(style = "padding-bottom: 20px;",
+        h2(strong(paste0(company_name, " (", symbol, ")")), style = "margin-top: 0px;"),
+        h4(paste0("Current Price: $", latest_price, "  |  As of: ", latest_date), style = "color: #555;")
+    )
   })
   
   # === METRICS UI ===
@@ -337,7 +386,8 @@ server <- function(input, output, session){
   output$stock_table <- renderDataTable({
     con <- get_db_connection()
     if (!is.null(con)) {
-      query <- sprintf("SELECT timestamp, open, close, predicted_close FROM predictions_log WHERE \"Symbol\" = '%s' ORDER BY timestamp ASC", input$global_symbol)
+      # Use a subquery to fetch only the 31 most recent days (to give 30 days of clean returns)
+      query <- sprintf("SELECT * FROM (SELECT timestamp, open, close, predicted_close FROM %s_predictions ORDER BY timestamp DESC LIMIT 31) sub ORDER BY timestamp ASC", input$global_symbol)
       tryCatch({
         stock_data <- DBI::dbGetQuery(con, query)
         DBI::dbDisconnect(con)
