@@ -1,372 +1,428 @@
 # Libraries
 library(shiny)
+library(shinydashboard)
 library(quantmod)
 library(TTR)
-library(datasets)
 library(plotly)
 library(ggplot2)
-library(shinythemes) 
 library(dplyr)
 library(lubridate)
+library(xgboost)
+library(DBI)
+library(RPostgres)
 
-# I) UI PART OF THE APPLICATION
-ui <- navbarPage(
-  # TITLE OF THE PROJECT
-  title = "API Driven Periodic - Stock Market Prediction of US Stocks",
-  # Black Theme 
-  theme = shinytheme("flatly"), 
-  # 1) HOME TAB CONTENT
-  tabPanel(
-    "Home",
-    mainPanel(
-      # Header and background text
-      h1("API Driven Periodic stock market prediction of US stocks"),
-      h2("Welcome Viewers!"),
-      h4("1) While our Stock Market Prediction tool isn't equipped for daily market movements or investment advice, it offers insightful projections of stock trends over intervals, guiding your financial journey with clarity and foresight."),
-      h4("2) The forecasting model utilizes a linear regression algorithm, drawing insights from Yahoo API data to anticipate discernible trends."),
-      h4("3) The app is made simple by integrating pretrained model weights to the server.R file, hence, faster prediction of data retrieved from API, also data is trained on the last 30 days from most recent date of retrieval"),
-      br(),
-      h2("Instructions for the Prediction Application:"),
-      h4("1) Head to the Prediction tab and witness the power of our API-driven prediction algorithm."),
-      h4("2) Utilize the dropdown menu to seamlessly explore predictions for the five designated stocks."),
-      h4("3) Upon selection, observe the top 5 rows and accompanying plot, offering a detailed comparison of actual performance versus predictions."),
-      h4("4) The model undergoes routine training, drawing from updates provided by the Yahoo API. Rest assured, its relevance will endure for months and years to come."),
-      br(),
-      h2("Data and Visualization:"),
-      h4("1) You can view the historical dataset, summary and structure for 5 different stocks in 'Data' tab"),
-      h4("2) You can view the Histogram, Boxplot, Scatterplot, and Linegraph for 5 different stocks in 'Visualization' tab"),
-    )
-  ),
-  # 2) DATA TAB CONTENT
-  tabPanel(
-    "Data",
-    # Output retrieved from Server 
-    uiOutput("header_text"),
-    # Sidebar layout
-    sidebarLayout(
-      sidebarPanel(
-        # Select between Dataset, Summary and Structure from the dropdown list
-        selectInput("data_type", "Select Data Operation:",
-                    choices = c("Dataset", "Summary", "Structure"),
-                    selected = "Dataset"),
-        # Select between AAPL, AMZN, NVDA, GOOGL, MSFT from the dropdown list
-        selectInput("dashboard_symbol", "Select Stock Symbol:",
+# Load database credentials securely from an external, git-ignored file
+source("credentials.R")
+
+ui <- dashboardPage(
+  skin = "blue",
+  dashboardHeader(title = "USA Live Stockmarket"),
+  dashboardSidebar(
+    br(),
+    div(style = "padding: 10px;",
+        selectInput("global_symbol", "Select Stock Symbol:",
                     choices = c("AAPL", "AMZN", "NVDA", "GOOGL", "MSFT"),
                     selected = "AAPL"),
-        # Output retrived from server for globe icon hyperlink
-        uiOutput("dashboard_globe_link")
+        uiOutput("global_globe_link")
+    )
+  ),
+  dashboardBody(
+    # Row for Metrics (Value Boxes)
+    fluidRow(
+      valueBoxOutput("profit_box", width = 4),
+      valueBoxOutput("accurate_box", width = 4),
+      valueBoxOutput("inaccurate_box", width = 4)
+    ),
+    
+    # Row for Graphs
+    fluidRow(
+      box(width = 6, status = "primary", solidHeader = TRUE, title = "Actual vs Predicted (Last 5 Days)",
+          plotlyOutput("stock_plot")
       ),
-      mainPanel(
-        # Output retrived from server for dataset output
-        uiOutput("selected_data_output")
+      box(width = 6, status = "warning", solidHeader = TRUE, title = "60-Day Macro Trend (Candlestick)",
+          plotlyOutput("candlestick_plot")
       )
-    )
-  ),
-  # 3) VISUALIZATION TAB CONTENT
-  tabPanel(
-    "Visualization",
-    # Output retrived from server for header output
-    uiOutput("header_text_1"),
-    sidebarLayout(
-      sidebarPanel(
-        # Select between Histogram, Boxplot_of_30_days, ScatterPlot_of_30_days, LineGraph_of_30_days from the dropdown list
-        selectInput("graph_type", "Select Graph Type:",
-                    choices = c("Histogram", "Boxplot_of_30_days", "ScatterPlot_of_30_days", "LineGraph_of_30_days"),
-                    selected = "Histogram"),
-        # Select between AAPL, AMZN, NVDA, GOOGL, MSFT from the dropdown list
-        selectInput("stock_symbol", "Select Stock Symbol:",
-                    choices = c("AAPL", "AMZN", "NVDA", "GOOGL", "MSFT"),
-                    selected = "AAPL"),
-        # Output retrived from server for globe icon hyperlink 
-        uiOutput("dashboard_viz_globe_link")
-      ),
-      mainPanel(
-        # Output retrived from server for plot
-        plotOutput("visualization_plot")
-        
-      )
-    )
-  ),
-  # 4) PREDICTION TAB CONTENT
-  tabPanel(
-    "Prediction",
-    # Output retrived from server for header text
-    uiOutput("header_text_2"),
-    sidebarLayout(
-      sidebarPanel(
-        # Select between AAPL, AMZN, NVDA, GOOGL, MSFT from the dropdown list
-        selectInput("symbol", "Select Stock Symbol:",
-                    choices = c("AAPL", "AMZN", "NVDA", "GOOGL", "MSFT"),
-                    selected = "AAPL"),
-        # Output retrived from server for globe icon hyperlink 
-        uiOutput("globe_link")
-      ),
-      
-      mainPanel(
-        # Plot Output retrived from server
-        plotlyOutput("stock_plot"),
-        # Text Output retrived from server 
-        textOutput("predicted_value"),
-        br(),
-        # Dataset table retrived from server  
-        dataTableOutput("stock_table")
+    ),
+    
+    # Row for Prediction Data Table
+    fluidRow(
+      box(width = 12, status = "success", solidHeader = TRUE, title = "Historical Prediction Logs",
+          fluidRow(
+            column(4, dateRangeInput("date_filter", "Filter Dates:", start = Sys.Date() - 30, end = Sys.Date() + 1)),
+            column(8, align = "right", downloadButton("download_predictions", "Download Predictions (.csv)"))
+          ),
+          br(),
+          dataTableOutput("stock_table")
       )
     )
   )
 )
 
-# II) SERVER PART OF THE APPLICATION
-
 server <- function(input, output, session){
   # Define reactive values to store data for each stock
   stocks_data <- reactiveValues(
-    AAPL = NULL,
-    AMZN = NULL,
-    NVDA = NULL,
-    GOOGL = NULL,
-    MSFT = NULL
+    AAPL = NULL, AMZN = NULL, NVDA = NULL, GOOGL = NULL, MSFT = NULL
   )
+  
+  # Reactive value for metrics
+  metrics_data <- reactiveValues(
+    profit = 0, accurate = 0, inaccurate = 0
+  )
+  
+  # Reactive value for candlestick data
+  candlestick_xts <- reactiveVal(NULL)
+
+  # Database connection helper
+  get_db_connection <- function() {
+    tryCatch({
+      DBI::dbConnect(
+        RPostgres::Postgres(),
+        host = SUPABASE_HOST,
+        port = SUPABASE_PORT,
+        dbname = SUPABASE_DBNAME,
+        user = SUPABASE_USER,
+        password = SUPABASE_PASSWORD
+      )
+    }, error = function(e) { NULL })
+  }
+
+  init_db <- function() {
+    con <- get_db_connection()
+    if (!is.null(con)) {
+      query <- "
+      CREATE TABLE IF NOT EXISTS predictions_log (
+        timestamp TEXT,
+        open NUMERIC,
+        close NUMERIC,
+        \"MA_seven\" NUMERIC,
+        \"MA_fourteen\" NUMERIC,
+        \"MA_twenty\" NUMERIC,
+        \"SD_seven\" NUMERIC,
+        \"SD_fourteen\" NUMERIC,
+        \"SD_twenty\" NUMERIC,
+        predicted_close NUMERIC,
+        \"Symbol\" TEXT
+      );
+      "
+      tryCatch({ DBI::dbExecute(con, query) }, error = function(e) { warning("Failed to initialize table: ", e$message) })
+      DBI::dbDisconnect(con)
+    }
+  }
+  init_db()
   
   # Create Function to update symbol data
   retrieveData <- function(symbol) {
-    # Retrieve data from Yahoo API for 60 days
-    getSymbols(symbol, src = "yahoo", from = Sys.Date()-60, to = Sys.Date())
+    if(is.null(symbol) || symbol == "") return()
     
-    # Extract the open price, close price and timestamp
-    open <- Op(get(symbol))
-    timestamp <- index(get(symbol))
-    close <- Cl(get(symbol))
+    # Retrieve data from Yahoo API for 90 days
+    getSymbols(symbol, src = "yahoo", from = Sys.Date()-90, to = Sys.Date())
+    
+    data_xts <- get(symbol)
+    # Store for candlestick
+    candlestick_xts(tail(data_xts, 60))
+    
+    open_price <- Op(data_xts)
+    close_price <- Cl(data_xts)
+    timestamp <- index(data_xts)
     
     # Feature engineering
-    MA_seven <- SMA(open, n = 7)
-    MA_fourteen <- SMA(open, n = 14)
-    MA_twenty <- SMA(open, n = 20)
-    SD_seven <- runSD(open, n = 7)
-    SD_fourteen <- runSD(open, n = 14)
-    SD_twenty <- runSD(open, n = 20)
-    
+    MA_seven <- SMA(open_price, n = 7)
+    MA_fourteen <- SMA(open_price, n = 14)
+    MA_twenty <- SMA(open_price, n = 20)
+    SD_seven <- runSD(open_price, n = 7)
+    SD_fourteen <- runSD(open_price, n = 14)
+    SD_twenty <- runSD(open_price, n = 20)
     
     # Create data frame with calculated features
     latest_opening <- data.frame(
-      timestamp = timestamp,
-      open = open,
-      close = close,
-      MA_seven = MA_seven,
-      MA_fourteen = MA_fourteen,
-      MA_twenty = MA_twenty,
-      SD_seven = SD_seven,
-      SD_fourteen = SD_fourteen,
-      SD_twenty = SD_twenty
+      timestamp = as.character(timestamp),
+      open = as.numeric(open_price),
+      close = as.numeric(close_price),
+      MA_seven = as.numeric(MA_seven),
+      MA_fourteen = as.numeric(MA_fourteen),
+      MA_twenty = as.numeric(MA_twenty),
+      SD_seven = as.numeric(SD_seven),
+      SD_fourteen = as.numeric(SD_fourteen),
+      SD_twenty = as.numeric(SD_twenty)
     )
     
-    # Drop rows with NA values
+    # Drop NA values (MAs introduce NAs at the start)
     latest_opening <- na.omit(latest_opening)
     
-    # Select the latest date for prediction
+    # Select the latest 30 dates for evaluation and prediction
     latest_opening <- tail(latest_opening, 30)
+    colnames(latest_opening) <- c("timestamp", "open", "close", "MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")
     
-    # Rename columns
-    colnames(latest_opening) <- c("timestamp", "open", "Close", "MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")
-    
-    # Only take the predictor/input variables 
-    latest_opening_F <- latest_opening[, c('MA_seven','MA_fourteen',
-                                           'MA_twenty',
-                                           'SD_seven',
-                                           'SD_fourteen',
-                                           'SD_twenty', 'Close')]
-    
-    # Load the saved model weights for linear regression
-    re_LR_model <- readRDS(paste0(symbol, "_LR.rds"))
-    
-    # Predict and add closing prices for the last 30 days
-    last_30_days <- tail(latest_opening_F, 30)
-    retrained_model <- update(re_LR_model, data = last_30_days)
-    # Retrieve data for last 5 days
-    predicted_close <- predict(retrained_model, newdata = tail(latest_opening, 5))
+    # Load the saved model weights for XGBoost
+    xgb_model_file <- paste0(symbol, "_XGB.rds")
     latest_opening$predicted_close <- NA
-    latest_opening$predicted_close[(nrow(latest_opening) - 4):nrow(latest_opening)] <- predicted_close
-    # Store the data for the selected stock
+    
+    if (file.exists(xgb_model_file)) {
+      model <- readRDS(xgb_model_file)
+      
+      # We predict the entire 30-day window to evaluate performance
+      X_pred <- as.matrix(latest_opening[, c("MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")])
+      preds <- predict(model, newdata = X_pred)
+      
+      # Shift predictions: preds[i] is the prediction for day i+1
+      latest_opening$predicted_close[2:nrow(latest_opening)] <- preds[1:(length(preds)-1)]
+      
+      # The very last prediction (preds[30]) is for TOMORROW
+      last_date <- as.Date(latest_opening$timestamp[nrow(latest_opening)])
+      next_date <- last_date + 1
+      if(wday(next_date) == 7) next_date <- next_date + 2 # skip saturday
+      if(wday(next_date) == 1) next_date <- next_date + 1 # skip sunday
+      
+      future_row <- data.frame(
+        timestamp = as.character(next_date),
+        open = NA, close = NA,
+        MA_seven = NA, MA_fourteen = NA, MA_twenty = NA,
+        SD_seven = NA, SD_fourteen = NA, SD_twenty = NA,
+        predicted_close = preds[length(preds)]
+      )
+      latest_opening <- rbind(latest_opening, future_row)
+      
+      # === CALCULATE METRICS (Over the historical 30 days) ===
+      cum_profit <- 0
+      accurate_count <- 0
+      inaccurate_count <- 0
+      
+      for(i in 2:(nrow(latest_opening)-1)) {
+        today_close <- latest_opening$close[i]
+        yesterday_close <- latest_opening$close[i-1]
+        predicted_today <- latest_opening$predicted_close[i]
+        
+        predicted_direction <- predicted_today > yesterday_close
+        actual_direction <- today_close > yesterday_close
+        
+        if(predicted_direction == actual_direction) {
+          accurate_count <- accurate_count + 1
+        } else {
+          inaccurate_count <- inaccurate_count + 1
+        }
+        
+        # Simulated Strategy: Long/Short
+        # If we predict UP, we go long. Profit = daily_return
+        # If we predict DOWN, we go short. Profit = -daily_return
+        daily_return_pct <- ((today_close - yesterday_close) / yesterday_close) * 100
+        
+        if(predicted_direction == TRUE) {
+          cum_profit <- cum_profit + daily_return_pct
+        } else {
+          cum_profit <- cum_profit - daily_return_pct
+        }
+      }
+      
+      metrics_data$profit <- round(cum_profit, 2)
+      metrics_data$accurate <- accurate_count
+      metrics_data$inaccurate <- inaccurate_count
+    }
+    
+    # Append the newly calculated FUTURE row to the cloud (Avoid duplicates)
+    con <- get_db_connection()
+    if (!is.null(con)) {
+      latest_opening$Symbol <- symbol
+      future_row_to_insert <- tail(latest_opening, 1)
+      
+      check_query <- sprintf(
+        "SELECT COUNT(*) FROM predictions_log WHERE \"Symbol\" = '%s' AND timestamp = '%s'", 
+        symbol, future_row_to_insert$timestamp
+      )
+      
+      tryCatch({ 
+        count_res <- DBI::dbGetQuery(con, check_query)
+        if (count_res[[1]] == 0) {
+          DBI::dbAppendTable(con, "predictions_log", future_row_to_insert) 
+        }
+      }, error = function(e) {})
+      DBI::dbDisconnect(con)
+    }
+    
+    # Convert timestamp back to Date for plotting
+    latest_opening$timestamp <- as.Date(latest_opening$timestamp)
     stocks_data[[symbol]] <- latest_opening
   }
   
-  # ---------------------------- (PREDICT TAB - START) ----------------------------
-  
-  # Map the selectInput for 'dashboard_symbol', 'stock_symbol', 'symbol' such that
-  # Whenever change in one tab, other tabs will also get the same symbol replaced
-  observe({
-    updateSelectInput(session, "dashboard_symbol", selected = input$symbol)
-    updateSelectInput(session, "stock_symbol", selected = input$symbol)
-    updateSelectInput(session, "symbol", selected = input$symbol)
-    retrieveData(input$symbol)
-  })
-  # Map the selectInput for 'dashboard_symbol', 'stock_symbol', 'symbol' such that
-  # Whenever change in one tab, other tabs will also get the same symbol replaced
-  observe({
-    updateSelectInput(session, "dashboard_symbol", selected = input$dashboard_symbol)
-    updateSelectInput(session, "stock_symbol", selected = input$dashboard_symbol)
-    updateSelectInput(session, "symbol", selected = input$dashboard_symbol)
-    retrieveData(input$dashboard_symbol)
-  })
-  # Map the selectInput for 'dashboard_symbol', 'stock_symbol', 'symbol' such that
-  # Whenever change in one tab, other tabs will also get the same symbol replaced
-  observe({
-    updateSelectInput(session, "dashboard_symbol", selected = input$stock_symbol)
-    updateSelectInput(session, "stock_symbol", selected = input$stock_symbol)
-    updateSelectInput(session, "symbol", selected = input$stock_symbol)
-    retrieveData(input$stock_symbol)
+  # Map the global selectInput to fetch data and refresh every 5 minutes (300,000 ms)
+  observe({ 
+    invalidateLater(300000, session)
+    retrieveData(input$global_symbol) 
   })
   
-  # Link the Globe icon to hyperlink for yahoo finance, so when you dropdown list
-  # changes, it will reroute to the correct link
-  output$globe_link <- renderUI({
-    tags$a(href = paste0("https://finance.yahoo.com/quote/", input$symbol),
-           icon("globe"), target="_blank")
-  })
-  # Link the Globe icon to hyperlink for yahoo finance, so when you dropdown list
-  # changes, it will reroute to the correct link
-  output$dashboard_globe_link <- renderUI({
-    tags$a(href = paste0("https://finance.yahoo.com/quote/", input$symbol),
-           icon("globe"), target="_blank")
-  })
-  # Link the Globe icon to hyperlink for yahoo finance, so when you dropdown list
-  # changes, it will reroute to the correct link
-  output$dashboard_viz_globe_link <- renderUI({
-    tags$a(href = paste0("https://finance.yahoo.com/quote/", input$symbol),
-           icon("globe"), target="_blank")
+  output$global_globe_link <- renderUI({
+    tags$a(href = paste0("https://finance.yahoo.com/quote/", input$global_symbol),
+           icon("globe"), target="_blank", style = "color: white;")
   })
   
+  # === METRICS UI ===
+  output$profit_box <- renderValueBox({
+    valueBox(
+      paste0(metrics_data$profit, "%"),
+      "30-Day Cumulative Profit (Strategy)",
+      icon = icon("piggy-bank"),
+      color = if(metrics_data$profit >= 0) "green" else "red"
+    )
+  })
   
-  # Plotting the Prediction Plot using Plotly
+  output$accurate_box <- renderValueBox({
+    valueBox(
+      metrics_data$accurate,
+      "Accurate Predictions",
+      icon = icon("thumbs-up"),
+      color = "green"
+    )
+  })
+  
+  output$inaccurate_box <- renderValueBox({
+    valueBox(
+      metrics_data$inaccurate,
+      "Inaccurate Predictions",
+      icon = icon("thumbs-down"),
+      color = "red"
+    )
+  })
+  
+  # === PLOTS ===
   output$stock_plot <- renderPlotly({
-    # Retrieve the selected stock data from Yahoo API
-    stock_data <- stocks_data[[input$symbol]]
+    stock_data <- stocks_data[[input$global_symbol]]
+    if(is.null(stock_data)) return()
     
-    # Filter the data to include only the week of prediction
-    prediction_week <- stock_data[stock_data$timestamp >= stock_data$timestamp[nrow(stock_data)] - 6, ]
+    # Show last 5 days
+    prediction_week <- tail(stock_data, 6)
     
-    # Store it in Dataframe
+    # Calculate UP/DOWN text for predictions
+    prediction_week$pred_text <- ""
+    for(i in 2:nrow(prediction_week)) {
+      if(prediction_week$predicted_close[i] > prediction_week$close[i-1]) {
+        prediction_week$pred_text[i] <- "UP"
+      } else {
+        prediction_week$pred_text[i] <- "DOWN"
+      }
+    }
+    
     plot_data <- data.frame(
       x = prediction_week$timestamp,
-      y_actual = prediction_week$Close,
-      y_predicted = prediction_week$predicted_close
+      y_actual = prediction_week$close,
+      y_predicted = prediction_week$predicted_close,
+      pred_text = prediction_week$pred_text
     )
-    # Plot the data for 5 days
     plot_ly(data = plot_data, x = ~x) %>%
-      add_lines(y = ~y_actual, name = 'Actual', color = I("blue")) %>%
-      add_lines(y = ~y_predicted, name = 'Predicted', color = I("red")) %>%
+      add_lines(y = ~y_actual, name = 'Actual', line = list(color = "blue", width = 3)) %>%
+      add_trace(y = ~y_predicted, name = 'Predicted', type = 'scatter', mode = 'lines+text+markers',
+                text = ~pred_text, textposition = 'top center', textfont = list(color = 'red', size = 12, weight = "bold"),
+                line = list(color = "red", width = 3, dash = 'dash')) %>%
       layout(
-        title = paste("Stock prediction over the last five days for", input$symbol),
         xaxis = list(title = "Date"),
         yaxis = list(title = "Close Price"),
-        legend = list(x = 0.8, y = 1)
+        legend = list(x = 0.1, y = 0.9)
       )
   })
-  # ---------------------------- (PREDICT TAB - END - TO BE CONTINUED) ----------------------------
   
-  
-  # ---------------------------- (HOME TAB - START) ----------------------------
-  output$stock_data_table <- renderDataTable({
-    symbol <- input$dashboard_symbol
-    data_file <- switch(symbol,
-                        "AAPL" = "AAPL.csv",
-                        "AMZN" = "AMZN.csv",
-                        "NVDA" = "NVDA.csv",
-                        "GOOGL" = "GOOGL.csv",
-                        "MSFT" = "MSFT.csv")
-    read.csv(data_file)
-  })
-  
-  # Function to update data based on Data operation
-  selected_data <- reactive({
-    symbol <- input$dashboard_symbol
-    data_file <- switch(symbol,
-                        "AAPL" = "AAPL.csv",
-                        "AMZN" = "AMZN.csv",
-                        "NVDA" = "NVDA.csv",
-                        "GOOGL" = "GOOGL.csv",
-                        "MSFT" = "MSFT.csv")
-    data <- read.csv(data_file)
-    switch(input$data_type,
-           "Summary" = summary(data), 
-           "Structure" = capture.output(str(data)),  
-           "Dataset" = data
-    )
-  })
-  
-  # Render the appropriate output based on the selected data type
-  output$selected_data_output <- renderUI({
-    if (input$data_type == "Dataset") {
-      dataTableOutput("stock_data_table")
-    } else if (input$data_type == "Summary" || input$data_type == "Structure") {
-      renderPrint({
-        selected_data()
-      })
-    }
-  })
-  # ----------------------- (HOME TAB - END) ----------------------------
-  
-  # ----------------------- (VISUALIZATION TAB - START) ----------------------------
-  #Load data for selected stock symbol
-  data <- reactive({
-    stock_data_1 <- switch(input$dashboard_symbol,
-                           "AAPL" = read.csv("AAPL.csv"),
-                           "AMZN" = read.csv("AMZN.csv"),
-                           "NVDA" = read.csv("NVDA.csv"),
-                           "GOOGL" = read.csv("GOOGL.csv"),
-                           "MSFT" = read.csv("MSFT.csv"))
-    # Convert Date column to Date format
-    #stock_data$Date <- as.Date(stock_data$Date, format = "%Y-%m-%d")
-  })
-  
-  
-  # Plotting function for selected graph type
-  output$visualization_plot <- renderPlot({
-    graph_type <- input$graph_type
-    stock_data_2 <- stocks_data[[input$symbol]]
-    stock_data_1 <- data()
-    if (graph_type == "Histogram") {
-      hist(stock_data_1$Volume, col = "red", main = "Histogram of Volume for 30 days",breaks = 400, xlab = "Volume")
-      # plot boxplot
-    } else if (graph_type == "Boxplot_of_30_days") {
-      boxplot(stock_data_2$Close, col ='red',main = "Boxplot of Closing Value for 30 days", ylab = "Close Value")
-      # Plot scatterplot
-    } else if (graph_type == "ScatterPlot_of_30_days") {
-      
-      plot(stock_data_2$timestamp,stock_data_2$Close, type = "p", col = "red" ,main = "Scatter Plot of last 30 days")
-      # plot lineplot
-    } else {
-      plot(stock_data_2$timestamp, stock_data_2$Close, type = "l",col = "red", main = "LineGraph")
-    }
-  })
-  
-  # ----------------------- (VISUALIZATION TAB - END) ----------------------------
-  
-  # ----------------------- (HEADER TEXT - START) ----------------------------
-  # HEADER TEXT IN DATA
-  output$header_text <- renderUI({
-    h3(paste("Historical Data of stocks -", input$dashboard_symbol))
-  })
-  # HEADER TEXT IN VISUALIZATION
-  output$header_text_1 <- renderUI({
-    h3(paste("Visualization of Historical stock data -", input$dashboard_symbol))
-  })
-  # HEADER TEXT IN PREDICTION
-  output$header_text_2 <- renderUI({
-    h3(paste("API driven Stock Prediction of", input$dashboard_symbol))
-  })
-  # ----------------------- (HEADER TEXT - END) ----------------------------
-  
-  # ----------------------- (PREDICTED TEXT - CONTINUATION) ----------------------------
-  # Render table for prediction tab
-  output$stock_table <- renderDataTable({
-    # Retrieve the selected stock data
-    stock_data <- stocks_data[[input$symbol]]
+  output$candlestick_plot <- renderPlotly({
+    df_xts <- candlestick_xts()
+    if(is.null(df_xts)) return()
     
-    # Return the last 5 rows of the data frame with selected columns
-    tail(stock_data[, c('timestamp', 'open', 'Close', 'predicted_close')], 5)
+    df <- data.frame(Date = index(df_xts), coredata(df_xts))
+    colnames(df) <- c("Date", "Open", "High", "Low", "Close", "Volume", "Adjusted")
+    
+    plot_ly(data = df, x = ~Date, type="candlestick",
+            open = ~Open, close = ~Close,
+            high = ~High, low = ~Low) %>%
+      layout(xaxis = list(rangeslider = list(visible = F)),
+             yaxis = list(title = "Price"))
   })
-  # ----------------------- (PREDICTED TEXT - END) ----------------------------
+  
+  # === TABLES ===
+  # Displays data from Supabase backend directly on the dashboard
+  output$stock_table <- renderDataTable({
+    con <- get_db_connection()
+    if (!is.null(con)) {
+      query <- sprintf("SELECT timestamp, open, close, predicted_close FROM predictions_log WHERE \"Symbol\" = '%s' ORDER BY timestamp ASC", input$global_symbol)
+      tryCatch({
+        stock_data <- DBI::dbGetQuery(con, query)
+        DBI::dbDisconnect(con)
+      }, error = function(e) { 
+        DBI::dbDisconnect(con) 
+        stock_data <- NULL
+      })
+    } else {
+      stock_data <- NULL
+    }
+    
+    # Fallback if Supabase is disconnected/not setup yet
+    if(is.null(stock_data)) {
+      stock_data <- stocks_data[[input$global_symbol]]
+      if(is.null(stock_data)) return()
+      stock_data <- stock_data[, c('timestamp', 'open', 'close', 'predicted_close')]
+    }
+    
+    # Sort chronologically to calculate lags correctly
+    stock_data <- stock_data[order(as.Date(stock_data$timestamp)), ]
+    
+    prev_close <- dplyr::lag(stock_data$close, 1)
+    
+    # Calculations
+    actual_return <- (stock_data$close - prev_close) / prev_close * 100
+    error_val <- abs(stock_data$predicted_close - stock_data$close)
+    error_pct <- (error_val / stock_data$close) * 100
+    
+    pred_signal <- ifelse(stock_data$predicted_close > prev_close, "Up", "Down")
+    actual_signal <- ifelse(stock_data$close > prev_close, "Up", "Down")
+    correct <- ifelse(pred_signal == actual_signal, "✅", "❌")
+    
+    # Strategy Return % (Long/Short Strategy)
+    strategy_return <- ifelse(pred_signal == "Up", actual_return, -actual_return)
+    strategy_return[is.na(strategy_return)] <- 0
+    cum_profit <- cumsum(strategy_return)
+    
+    # Formatting the dataframe
+    formatted_data <- data.frame(
+      Date = stock_data$timestamp,
+      Open = round(stock_data$open, 2),
+      `Actual Close` = round(stock_data$close, 2),
+      `Pred Close` = round(stock_data$predicted_close, 2),
+      `Daily Profit %` = sprintf("%.2f%%", strategy_return),
+      Error = sprintf("%.2f", error_val),
+      `Error %` = sprintf("%.2f%%", error_pct),
+      `Pred Signal` = pred_signal,
+      `Actual Signal` = actual_signal,
+      Correct = correct,
+      `Cum. Profit %` = sprintf("%.2f%%", cum_profit),
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+    
+    # Handle NA for future prediction row (Tomorrow)
+    is_future <- is.na(stock_data$close)
+    formatted_data$`Daily Profit %`[is_future] <- ""
+    formatted_data$Error[is_future] <- ""
+    formatted_data$`Error %`[is_future] <- ""
+    formatted_data$`Actual Signal`[is_future] <- ""
+    formatted_data$Correct[is_future] <- "⏳"
+    formatted_data$`Cum. Profit %`[is_future] <- ""
+    
+    # Handle NA for the very first row due to lag
+    formatted_data$`Pred Signal`[is.na(prev_close)] <- ""
+    formatted_data$`Actual Signal`[is.na(prev_close)] <- ""
+    formatted_data$Correct[is.na(prev_close)] <- ""
+    formatted_data$`Daily Profit %`[is.na(prev_close)] <- ""
+    
+    # Filter by Date Range
+    filter_dates <- as.Date(formatted_data$Date)
+    mask <- filter_dates >= input$date_filter[1] & filter_dates <= input$date_filter[2]
+    formatted_data <- formatted_data[mask, ]
+    
+    # Sort descending to show newest first
+    formatted_data <- formatted_data[order(as.Date(formatted_data$Date), decreasing = TRUE), ]
+    
+    formatted_data
+  }, options = list(pageLength = 15, scrollX = TRUE))
+  
+  # Download Handlers
+  output$download_predictions <- downloadHandler(
+    filename = function() { paste0(input$global_symbol, "_predictions.csv") },
+    content = function(file) { write.csv(stocks_data[[input$global_symbol]], file, row.names = FALSE) }
+  )
 }
 
-# Run the application
 shinyApp(ui = ui, server = server)
