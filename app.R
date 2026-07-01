@@ -110,6 +110,9 @@ ui <- dashboardPage(
   )
 )
 
+# Global timer to track the last background sync across all user sessions
+global_last_sync <- Sys.time() - as.difftime(12, units = "hours")
+
 server <- function(input, output, session){
   # Define reactive values to store data for each stock
   stocks_data <- reactiveValues(
@@ -143,21 +146,53 @@ server <- function(input, output, session){
     }, error = function(e) { NULL })
   }
 
-
+  # Fast UI Loader (No XGBoost, No DB Upserts, just reads data)
+  loadDataForUI <- function(symbol) {
+    if(is.null(symbol) || symbol == "") return()
+    
+    # 1. Fetch basic Yahoo data just for the Candlestick chart
+    tryCatch({
+      getSymbols(symbol, src = "yahoo", from = Sys.Date()-60, to = Sys.Date())
+      data_xts <- get(symbol)
+      candlestick_xts(data_xts)
+    }, error = function(e) {})
+    
+    # 2. Fetch the pre-calculated AI predictions directly from Neon Cloud
+    con <- get_db_connection()
+    if(!is.null(con)) {
+      db_data <- tryCatch({ DBI::dbGetQuery(con, paste0("SELECT * FROM ", symbol, "_predictions ORDER BY timestamp DESC LIMIT 30")) }, error = function(e) { NULL })
+      if (!is.null(db_data) && nrow(db_data) > 0) {
+        db_data <- db_data[order(as.Date(db_data$timestamp)), ]
+        db_data$timestamp <- as.Date(db_data$timestamp)
+        stocks_data[[symbol]] <- db_data
+        
+        # Compute UI metrics from the loaded database rows
+        if(nrow(db_data) > 1) {
+          metrics_data$accurate <- sum(db_data$correct == "✅", na.rm = TRUE)
+          metrics_data$inaccurate <- sum(db_data$correct == "❌", na.rm = TRUE)
+          total_resolved <- metrics_data$accurate + metrics_data$inaccurate
+          metrics_data$win_rate <- if(total_resolved > 0) round((metrics_data$accurate / total_resolved) * 100, 1) else 0
+          
+          strat_executed <- db_data$actual_return[!is.na(db_data$correct) & db_data$correct %in% c("✅", "❌")]
+          metrics_data$profit <- if(length(strat_executed) > 0) round(sum(strat_executed, na.rm = TRUE), 2) else 0
+          metrics_data$avg_profit <- if(length(strat_executed) > 0) round(mean(strat_executed, na.rm = TRUE), 2) else 0
+          metrics_data$pending <- sum(db_data$correct == "⏳", na.rm = TRUE)
+        }
+      }
+      DBI::dbDisconnect(con)
+    }
+  }
   
-  # Create Function to update symbol data
+  # Create Function to run the heavy AI sync and UPSERT to Cloud
   retrieveData <- function(symbol) {
     if(is.null(symbol) || symbol == "") return()
     
-    withProgress(message = paste('Syncing Live Data for', symbol), value = 0, {
-      
-      incProgress(0.2, detail = "Fetching from Yahoo Finance...")
-      # Retrieve data from Yahoo API for 90 days
-      getSymbols(symbol, src = "yahoo", from = Sys.Date()-90, to = Sys.Date())
-      
-      data_xts <- get(symbol)
-      # Store for candlestick
-      candlestick_xts(tail(data_xts, 60))
+    # Retrieve data from Yahoo API for 90 days
+    getSymbols(symbol, src = "yahoo", from = Sys.Date()-90, to = Sys.Date())
+    
+    data_xts <- get(symbol)
+    # Store for candlestick
+    candlestick_xts(tail(data_xts, 60))
     
     open_price <- Op(data_xts)
     close_price <- Cl(data_xts)
@@ -190,8 +225,6 @@ server <- function(input, output, session){
     # Select the latest 30 dates for evaluation and prediction
     latest_opening <- tail(latest_opening, 30)
     colnames(latest_opening) <- c("timestamp", "open", "close", "MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")
-    
-    incProgress(0.5, detail = "Running XGBoost Inference...")
     
     # Load the saved model weights for XGBoost from models folder
     xgb_model_file <- paste0("models/", symbol, "_XGB.rds")
@@ -264,8 +297,6 @@ server <- function(input, output, session){
       metrics_data$avg_profit <- if(length(strat_executed) > 0) round(mean(strat_executed, na.rm = TRUE), 2) else 0
       metrics_data$pending <- sum(latest_opening$correct == "⏳", na.rm = TRUE)
     }
-    
-    incProgress(0.8, detail = "Syncing with Neon Cloud DB...")
     
     # Upsert the entire 30-day block (and tomorrow's future prediction) to the cloud
     con <- get_db_connection()
@@ -355,19 +386,40 @@ server <- function(input, output, session){
       DBI::dbDisconnect(con)
     }
     
-    incProgress(1.0, detail = "Done!")
-    
     # Convert timestamp back to Date for plotting
     latest_opening$timestamp <- as.Date(latest_opening$timestamp)
     stocks_data[[symbol]] <- latest_opening
-    
-    }) # End withProgress
   }
   
-  # Map the global selectInput to fetch data and refresh every 12 hours (43,200,000 ms)
-  observe({ 
+  # Background Sync: STRICTLY only runs once every 12 hours globally, never on page refresh
+  observe({
     invalidateLater(43200000, session)
-    retrieveData(input$global_symbol) 
+    
+    # Check if 12 hours have passed since the LAST global sync (using 11.9 to be safe with execution times)
+    time_since_sync <- as.numeric(difftime(Sys.time(), global_last_sync, units = "hours"))
+    
+    if (time_since_sync > 11.9) {
+      global_last_sync <<- Sys.time() # Instantly lock it so other users/refreshes don't trigger it
+      
+      symbols_list <- c("AAPL", "AMZN", "NVDA", "GOOGL", "MSFT")
+      withProgress(message = 'Syncing Live Markets to Cloud...', value = 0, {
+        for(i in seq_along(symbols_list)) {
+          sym <- symbols_list[i]
+          incProgress(1/length(symbols_list), detail = paste("Processing", sym))
+          tryCatch({ retrieveData(sym) }, error = function(e) {})
+        }
+      })
+      
+      # Reload the UI with the fresh data
+      loadDataForUI(input$global_symbol)
+    }
+  })
+  
+  # Ensure the active symbol selected in the UI is ALWAYS loaded into memory quickly
+  observeEvent(input$global_symbol, {
+    withProgress(message = paste("Loading", input$global_symbol), value = 0.5, {
+      loadDataForUI(input$global_symbol)
+    })
   })
   
   output$global_globe_link <- renderUI({
