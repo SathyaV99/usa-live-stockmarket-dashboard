@@ -43,6 +43,11 @@ ui <- dashboardPage(
       valueBoxOutput("accurate_box", width = 4),
       valueBoxOutput("inaccurate_box", width = 4)
     ),
+    fluidRow(
+      valueBoxOutput("win_rate_box", width = 4),
+      valueBoxOutput("avg_profit_box", width = 4),
+      valueBoxOutput("pending_box", width = 4)
+    ),
     
     # Row for Graphs
     fluidRow(
@@ -58,10 +63,10 @@ ui <- dashboardPage(
     fluidRow(
       box(width = 12, status = "success", solidHeader = TRUE, title = "Historical Prediction Logs",
           fluidRow(
-            column(4, dateRangeInput("date_filter", "Filter Dates:", start = Sys.Date() - 30, end = Sys.Date() + 1)),
-            column(8, align = "right", downloadButton("download_predictions", "Download Predictions (.csv)"))
+            column(12, align = "right", downloadButton("download_predictions", "Download Predictions (.csv)"))
           ),
           br(),
+          tags$div(style = "color: red; font-weight: bold; margin-bottom: 10px;", "➡️ More columns to the right, scroll to view"),
           dataTableOutput("stock_table")
       )
     )
@@ -73,7 +78,10 @@ ui <- dashboardPage(
           box(width = 12, status = "primary", title = "Custom Backtester Sandbox", solidHeader = TRUE,
             p("Test the AI on any custom historical dates. This runs entirely in a local sandbox and will NOT affect your live Neon database."),
             fluidRow(
-              column(4, dateRangeInput("bt_dates", "Select Custom Date Range (Max 15 days):", start = Sys.Date() - 15, end = Sys.Date())),
+              column(4, dateInput("bt_start_date", "Select Start Date (Tests next 15 days):", 
+                                  value = Sys.Date() - 15,
+                                  max = Sys.Date() - 15)),
+              column(2, actionButton("reset_date", "Reset to Current", class="btn-secondary", style="margin-top: 25px;")),
               column(4, actionButton("run_bt", "Run AI Simulation", class="btn-primary", style="margin-top: 25px;"))
             )
           )
@@ -84,7 +92,16 @@ ui <- dashboardPage(
           valueBoxOutput("bt_inaccurate_box", width = 4)
         ),
         fluidRow(
+          box(width = 6, status = "primary", solidHeader = TRUE, title = "Actual vs Predicted",
+              plotlyOutput("bt_stock_plot")
+          ),
+          box(width = 6, status = "warning", solidHeader = TRUE, title = "Candlestick Trend",
+              plotlyOutput("bt_candlestick_plot")
+          )
+        ),
+        fluidRow(
           box(width = 12, status = "success", title = "Backtest Results", solidHeader = TRUE,
+              tags$div(style = "color: red; font-weight: bold; margin-bottom: 10px;", "➡️ More columns to the right, scroll to view"),
               dataTableOutput("bt_table")
           )
         )
@@ -101,7 +118,8 @@ server <- function(input, output, session){
   
   # Reactive value for metrics
   metrics_data <- reactiveValues(
-    profit = 0, accurate = 0, inaccurate = 0
+    profit = 0, accurate = 0, inaccurate = 0,
+    win_rate = 0, avg_profit = 0, pending = 0
   )
   
   # Reactive value for candlestick data
@@ -109,6 +127,7 @@ server <- function(input, output, session){
   
   # Reactive value for backtester results
   bt_results <- reactiveVal(NULL)
+  bt_candlestick_xts <- reactiveVal(NULL)
 
   # Database connection helper
   get_db_connection <- function() {
@@ -130,12 +149,15 @@ server <- function(input, output, session){
   retrieveData <- function(symbol) {
     if(is.null(symbol) || symbol == "") return()
     
-    # Retrieve data from Yahoo API for 90 days
-    getSymbols(symbol, src = "yahoo", from = Sys.Date()-90, to = Sys.Date())
-    
-    data_xts <- get(symbol)
-    # Store for candlestick
-    candlestick_xts(tail(data_xts, 60))
+    withProgress(message = paste('Syncing Live Data for', symbol), value = 0, {
+      
+      incProgress(0.2, detail = "Fetching from Yahoo Finance...")
+      # Retrieve data from Yahoo API for 90 days
+      getSymbols(symbol, src = "yahoo", from = Sys.Date()-90, to = Sys.Date())
+      
+      data_xts <- get(symbol)
+      # Store for candlestick
+      candlestick_xts(tail(data_xts, 60))
     
     open_price <- Op(data_xts)
     close_price <- Cl(data_xts)
@@ -168,6 +190,8 @@ server <- function(input, output, session){
     # Select the latest 30 dates for evaluation and prediction
     latest_opening <- tail(latest_opening, 30)
     colnames(latest_opening) <- c("timestamp", "open", "close", "MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")
+    
+    incProgress(0.5, detail = "Running XGBoost Inference...")
     
     # Load the saved model weights for XGBoost from models folder
     xgb_model_file <- paste0("models/", symbol, "_XGB.rds")
@@ -232,7 +256,16 @@ server <- function(input, output, session){
       metrics_data$profit <- round(tail(latest_opening$cum_profit_pct, 1), 2)
       metrics_data$accurate <- sum(latest_opening$correct == "✅", na.rm = TRUE)
       metrics_data$inaccurate <- sum(latest_opening$correct == "❌", na.rm = TRUE)
+      
+      # Additional new metrics
+      total_completed <- metrics_data$accurate + metrics_data$inaccurate
+      metrics_data$win_rate <- ifelse(total_completed > 0, round((metrics_data$accurate / total_completed) * 100, 2), 0)
+      strat_executed <- strategy_return[latest_opening$correct %in% c("✅", "❌")]
+      metrics_data$avg_profit <- if(length(strat_executed) > 0) round(mean(strat_executed, na.rm = TRUE), 2) else 0
+      metrics_data$pending <- sum(latest_opening$correct == "⏳", na.rm = TRUE)
     }
+    
+    incProgress(0.8, detail = "Syncing with Neon Cloud DB...")
     
     # Upsert the entire 30-day block (and tomorrow's future prediction) to the cloud
     con <- get_db_connection()
@@ -269,9 +302,9 @@ server <- function(input, output, session){
       tryCatch({ DBI::dbExecute(con, query_create) }, error = function(e) {})
       
       # UPSERT Loop
-      # We only UPSERT the last 3 days to avoid pointlessly overwriting the older 27 days 
-      # that haven't changed. This updates yesterday's NULL close and inserts tomorrow's prediction.
-      recent_opening <- tail(latest_opening, 3)
+      # We UPSERT all 31 recent days so the database always has a full 30-day historical log table.
+      # This updates yesterday's NULL close and inserts tomorrow's prediction.
+      recent_opening <- latest_opening
       for(i in 1:nrow(recent_opening)) {
         # Using COALESCE on predicted_close ensures we NEVER overwrite an older historical prediction
         # with a new prediction, preserving the true historical backtest log perfectly!
@@ -322,9 +355,13 @@ server <- function(input, output, session){
       DBI::dbDisconnect(con)
     }
     
+    incProgress(1.0, detail = "Done!")
+    
     # Convert timestamp back to Date for plotting
     latest_opening$timestamp <- as.Date(latest_opening$timestamp)
     stocks_data[[symbol]] <- latest_opening
+    
+    }) # End withProgress
   }
   
   # Map the global selectInput to fetch data and refresh every 12 hours (43,200,000 ms)
@@ -389,6 +426,33 @@ server <- function(input, output, session){
       "Inaccurate Predictions",
       icon = icon("thumbs-down"),
       color = "red"
+    )
+  })
+  
+  output$win_rate_box <- renderValueBox({
+    valueBox(
+      paste0(metrics_data$win_rate, "%"),
+      "Model Win Rate",
+      icon = icon("percent"),
+      color = "purple"
+    )
+  })
+  
+  output$avg_profit_box <- renderValueBox({
+    valueBox(
+      paste0(metrics_data$avg_profit, "%"),
+      "Avg Daily Strategy Return",
+      icon = icon("chart-line"),
+      color = "aqua"
+    )
+  })
+  
+  output$pending_box <- renderValueBox({
+    valueBox(
+      metrics_data$pending,
+      "Pending Future Predictions",
+      icon = icon("hourglass-half"),
+      color = "yellow"
     )
   })
   
@@ -483,11 +547,6 @@ server <- function(input, output, session){
       check.names = FALSE
     )
     
-    # Filter by Date Range
-    filter_dates <- as.Date(formatted_data$Date)
-    mask <- filter_dates >= input$date_filter[1] & filter_dates <= input$date_filter[2]
-    formatted_data <- formatted_data[mask, ]
-    
     # Sort descending to show newest first
     formatted_data <- formatted_data[order(as.Date(formatted_data$Date), decreasing = TRUE), ]
     
@@ -495,21 +554,36 @@ server <- function(input, output, session){
   }, options = list(pageLength = 15, scrollX = TRUE))
   
   # === BACKTESTER SERVER LOGIC ===
+  # Update the minimum allowable date based on the specific stock's IPO + 90 days
+  observeEvent(input$global_symbol, {
+    ipo_dates <- list(
+      "AAPL" = as.Date("1980-12-12") + 90,
+      "AMZN" = as.Date("1997-05-15") + 90,
+      "MSFT" = as.Date("1986-03-13") + 90,
+      "GOOGL" = as.Date("2004-08-19") + 90,
+      "NVDA" = as.Date("1999-01-22") + 90
+    )
+    updateDateInput(session, "bt_start_date", min = ipo_dates[[input$global_symbol]])
+  })
+  
+  observeEvent(input$reset_date, {
+    updateDateInput(session, "bt_start_date", value = Sys.Date() - 15)
+  })
+  
   observeEvent(input$run_bt, {
     symbol <- input$global_symbol
-    start_date <- as.Date(input$bt_dates[1])
-    end_date <- as.Date(input$bt_dates[2])
+    start_date <- as.Date(input$bt_start_date)
+    end_date <- start_date + 15
+    if (end_date > Sys.Date()) end_date <- Sys.Date()
     
-    # Safety Check: Prevent massive computations or API bans
-    if (as.numeric(end_date - start_date) > 15) {
-      showNotification("To prevent heavy computational load, please select a window of 15 days or less.", type = "error")
-      return()
-    }
-    
-    # Fetch 60 days early to ensure Moving Averages are fully populated before the true start date
+    withProgress(message = 'Running Historical Sandbox', value = 0, {
+      
+      incProgress(0.2, detail = "Fetching Historical Data...")
+      # Fetch 400 days early to ensure enough data for a robust 1-year (252 trading days) training set
     tryCatch({
-      getSymbols(symbol, src = "yahoo", from = start_date - 60, to = end_date)
+      getSymbols(symbol, src = "yahoo", from = start_date - 400, to = end_date)
       data_xts <- get(symbol)
+      bt_candlestick_xts(tail(data_xts, 60))
       
       open_price <- Op(data_xts)
       close_price <- Cl(data_xts)
@@ -526,21 +600,41 @@ server <- function(input, output, session){
         SD_fourteen = as.numeric(runSD(open_price, n = 14)),
         SD_twenty = as.numeric(runSD(open_price, n = 20))
       )
+      bt_data$Target_Close <- dplyr::lead(bt_data$close, 1)
       bt_data <- na.omit(bt_data)
-      bt_data$predicted_close <- NA
       
-      xgb_model_file <- paste0("models/", symbol, "_XGB.rds")
-      if (file.exists(xgb_model_file)) {
-        model <- readRDS(xgb_model_file)
-        X_pred <- as.matrix(bt_data[, c("MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")])
-        preds <- predict(model, newdata = X_pred)
+      incProgress(0.5, detail = "Starting Sliding Window AI Simulation...")
+      
+      bt_data$predicted_close <- NA
+      test_dates <- bt_data$timestamp[bt_data$timestamp >= start_date & bt_data$timestamp <= end_date]
+      
+      # True Walk-Forward Sliding Window (Mimics Live Monitoring exactly!)
+      for (i in seq_along(test_dates)) {
+        current_date <- test_dates[i]
         
-        # STRICT 1-DAY SHIFT: This physically forces the model's prediction for row (i) 
-        # to be logged as the prediction for row (i+1). 
-        # There is 0% chance of data leakage here.
-        bt_data$predicted_close[2:nrow(bt_data)] <- preds[1:(length(preds)-1)]
+        # Step 1: Extract 30 days strictly prior to current_date
+        train_candidates <- bt_data[bt_data$timestamp < current_date, ]
+        if(nrow(train_candidates) < 30) next
+        train_data <- tail(train_candidates, 30)
         
-        # Vectorized Metrics Calculation
+        # Step 2: Train exact replica of Live AI (30 rows, nrounds=10)
+        X_train <- as.matrix(train_data[, c("MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")])
+        Y_train <- train_data$Target_Close
+        temp_model <- xgboost(data = X_train, label = Y_train, nrounds = 10, objective = "reg:squarederror", verbose = 0)
+        
+        # Step 3: Predict using ONLY current_date features
+        current_row <- bt_data[bt_data$timestamp == current_date, ]
+        X_pred <- as.matrix(current_row[, c("MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")])
+        pred <- predict(temp_model, newdata = X_pred)
+        
+        # Step 4: Strict 1-Day Forward Log (Features from today predict tomorrow)
+        row_idx <- which(bt_data$timestamp == current_date)
+        if(row_idx < nrow(bt_data)) {
+          bt_data$predicted_close[row_idx + 1] <- pred
+        }
+      }
+        
+      # Vectorized Metrics Calculation
         prev_close <- dplyr::lag(bt_data$close, 1)
         bt_data$actual_return <- (bt_data$close - prev_close) / prev_close * 100
         bt_data$error_val <- abs(bt_data$predicted_close - bt_data$close)
@@ -557,9 +651,12 @@ server <- function(input, output, session){
         strat_ret_filtered[is.na(strat_ret_filtered)] <- 0
         bt_data$cum_profit_pct <- cumsum(strat_ret_filtered)
         
+        incProgress(1.0, detail = "Done!")
+        
         bt_results(bt_data)
-      }
     }, error = function(e) { print(e) })
+    
+    }) # End withProgress
   })
   
   # === BACKTESTER UI OUTPUTS ===
@@ -580,6 +677,41 @@ server <- function(input, output, session){
     res <- bt_results()
     if(is.null(res)) return(valueBox(0, "Inaccurate Predictions", icon=icon("thumbs-down"), color="red"))
     valueBox(sum(res$correct == "❌", na.rm=TRUE), "Inaccurate Predictions", icon=icon("thumbs-down"), color="red")
+  })
+  
+  output$bt_stock_plot <- renderPlotly({
+    res <- bt_results()
+    if(is.null(res)) return(NULL)
+    
+    # Calculate UP/DOWN text for predictions
+    res$pred_text <- ""
+    for(i in 2:nrow(res)) {
+      if(!is.na(res$predicted_close[i]) && !is.na(res$close[i-1])) {
+        if(res$predicted_close[i] > res$close[i-1]) res$pred_text[i] <- "UP" else res$pred_text[i] <- "DOWN"
+      }
+    }
+    
+    plot_data <- data.frame(
+      x = res$timestamp,
+      y_actual = res$close,
+      y_predicted = res$predicted_close,
+      pred_text = res$pred_text
+    )
+    plot_ly(data = plot_data, x = ~x) %>%
+      add_lines(y = ~y_actual, name = 'Actual', line = list(color = "blue", width = 3)) %>%
+      add_trace(y = ~y_predicted, name = 'Predicted', type = 'scatter', mode = 'lines+text+markers',
+                text = ~pred_text, textposition = 'top center', textfont = list(color = 'red', size = 12, weight = "bold"),
+                line = list(color = "red", width = 3, dash = 'dash')) %>%
+      layout(xaxis = list(title = "Date"), yaxis = list(title = "Close Price"), legend = list(x = 0.1, y = 0.9))
+  })
+  
+  output$bt_candlestick_plot <- renderPlotly({
+    df_xts <- bt_candlestick_xts()
+    if(is.null(df_xts)) return()
+    df <- data.frame(Date = index(df_xts), coredata(df_xts))
+    colnames(df) <- c("Date", "Open", "High", "Low", "Close", "Volume", "Adjusted")
+    plot_ly(data = df, x = ~Date, type="candlestick", open = ~Open, close = ~Close, high = ~High, low = ~Low) %>%
+      layout(xaxis = list(rangeslider = list(visible = F)), yaxis = list(title = "Price"))
   })
   
   output$bt_table <- renderDataTable({

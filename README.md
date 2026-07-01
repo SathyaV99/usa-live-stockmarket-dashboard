@@ -30,14 +30,16 @@ The dashboard operates on a dynamic multi-tab interface:
 
 ### Tab 1: Live Monitoring (Cloud Connected)
 - **Top Header**: Dynamically displays the company name, absolute latest closing price, and exact date.
-- **Value Boxes**: Calculates a simulated 30-Day Cumulative Profit strategy and counts accurate (✅) vs inaccurate (❌) predictions.
+- **Advanced KPIs**: Calculates a simulated 30-Day Cumulative Profit strategy, Model Win Rate, Avg Daily Return, and counts accurate (✅) vs inaccurate (❌) vs pending (⏳) predictions.
 - **Prediction Chart (5 Days)**: A line chart comparing the actual close prices to the model's predicted close prices, complete with explicit **UP** and **DOWN** markers.
 - **Macro Trend Chart (60 Days)**: A classic Candlestick chart to provide visual context on recent momentum.
 - **Neon Cloud Logging**: The app connects directly to Neon, generating 5 dedicated tables (e.g., `AAPL_predictions`). It runs an intelligent PostgreSQL `UPSERT` script to update today's actual close price while **strictly preserving** the historical prediction exactness via a `COALESCE` lock.
 
 ### Tab 2: Historical Backtester (Sandbox)
-- **Custom Timeframes**: Pick any historical start and end date (Max 15-day range to prevent API timeouts).
-- **Zero Leakage Guarantee**: The sandbox fetches data 60 days *prior* to your start date to cleanly build the Moving Averages. During inference, the model generates predictions using only historical features, and physically shifts that prediction down by exactly 1 row (`preds[i] -> row[i+1]`). The AI is mathematically blinded to the future!
+- **Walk-Forward ML Engine**: Replicates the Live Monitoring logic perfectly in history. The sandbox loops over your 15-day test window and dynamically trains a custom, temporary XGBoost model for *every single day* using the exact 30 days of data strictly prior to that specific day.
+- **Dynamic Timeline Protection**: The UI automatically computes the exact IPO date of the selected company, preventing users from selecting backtest dates that lack sufficient historical data.
+- **Zero Leakage Guarantee**: The engine generates predictions using only historical features, and physically shifts that prediction down by exactly 1 row (`preds[i] -> row[i+1]`). The AI is mathematically blinded to the future!
+- **Visual Analytics**: Instantly generates Actual vs Predicted comparison graphs and Candlestick context charts directly in the sandbox.
 - **Zero Cloud Impact**: The sandbox completely bypasses the Neon database, ensuring your live tracking is never contaminated by your experiments.
 
 ---
