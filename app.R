@@ -10,6 +10,7 @@ library(lubridate)
 library(xgboost)
 library(DBI)
 library(RPostgres)
+library(DT)
 
 # Load database credentials securely from an external, git-ignored file
 source("config/credentials.R")
@@ -66,8 +67,8 @@ ui <- dashboardPage(
             column(12, align = "right", downloadButton("download_predictions", "Download Predictions (.csv)"))
           ),
           br(),
-          tags$div(style = "color: red; font-weight: bold; margin-bottom: 10px;", "➡️ More columns to the right, scroll to view"),
-          dataTableOutput("stock_table")
+          tags$div(style = "color: red; font-weight: bold; margin-bottom: 10px;", "➡️ Scroll horizontally to view all metrics (The Date column will stay frozen for easy tracking)"),
+          DT::dataTableOutput("stock_table")
       )
     )
       ),
@@ -101,8 +102,8 @@ ui <- dashboardPage(
         ),
         fluidRow(
           box(width = 12, status = "success", title = "Backtest Results", solidHeader = TRUE,
-              tags$div(style = "color: red; font-weight: bold; margin-bottom: 10px;", "➡️ More columns to the right, scroll to view"),
-              dataTableOutput("bt_table")
+              tags$div(style = "color: red; font-weight: bold; margin-bottom: 10px;", "➡️ Scroll horizontally to view all metrics (The Date column will stay frozen for easy tracking)"),
+              DT::dataTableOutput("bt_table")
           )
         )
       )
@@ -110,20 +111,31 @@ ui <- dashboardPage(
   )
 )
 
-# Global timer to track the last background sync across all user sessions
-global_last_sync <- Sys.time() - as.difftime(12, units = "hours")
+# Global tracker for the last market day we synced
+global_last_sync_date <- as.Date("2000-01-01")
 
 server <- function(input, output, session){
-  # Define reactive values to store data for each stock
+  # Reactive values for stock data
   stocks_data <- reactiveValues(
     AAPL = NULL, AMZN = NULL, NVDA = NULL, GOOGL = NULL, MSFT = NULL
   )
   
-  # Reactive value for metrics
-  metrics_data <- reactiveValues(
-    profit = 0, accurate = 0, inaccurate = 0,
-    win_rate = 0, avg_profit = 0, pending = 0
-  )
+  last_sync_time <- reactiveVal(NULL)
+  
+  # Periodically fetch the latest sync timestamp from DB to update 'hours ago'
+  observe({
+    invalidateLater(60000, session)
+    con <- get_db_connection()
+    if (!is.null(con)) {
+      tryCatch({
+        res <- DBI::dbGetQuery(con, "SELECT last_sync FROM sync_status WHERE id = 1")
+        if (nrow(res) > 0) {
+          last_sync_time(as.POSIXct(res$last_sync[1], tz="UTC"))
+        }
+      }, error = function(e) {})
+      DBI::dbDisconnect(con)
+    }
+  })
   
   # Reactive value for candlestick data
   candlestick_xts <- reactiveVal(NULL)
@@ -165,253 +177,31 @@ server <- function(input, output, session){
         db_data <- db_data[order(as.Date(db_data$timestamp)), ]
         db_data$timestamp <- as.Date(db_data$timestamp)
         stocks_data[[symbol]] <- db_data
-        
-        # Compute UI metrics from the loaded database rows
-        if(nrow(db_data) > 1) {
-          metrics_data$accurate <- sum(db_data$correct == "✅", na.rm = TRUE)
-          metrics_data$inaccurate <- sum(db_data$correct == "❌", na.rm = TRUE)
-          total_resolved <- metrics_data$accurate + metrics_data$inaccurate
-          metrics_data$win_rate <- if(total_resolved > 0) round((metrics_data$accurate / total_resolved) * 100, 1) else 0
-          
-          strat_executed <- db_data$actual_return[!is.na(db_data$correct) & db_data$correct %in% c("✅", "❌")]
-          metrics_data$profit <- if(length(strat_executed) > 0) round(sum(strat_executed, na.rm = TRUE), 2) else 0
-          metrics_data$avg_profit <- if(length(strat_executed) > 0) round(mean(strat_executed, na.rm = TRUE), 2) else 0
-          metrics_data$pending <- sum(db_data$correct == "⏳", na.rm = TRUE)
-        }
       }
       DBI::dbDisconnect(con)
     }
   }
   
-  # Create Function to run the heavy AI sync and UPSERT to Cloud
-  retrieveData <- function(symbol) {
-    if(is.null(symbol) || symbol == "") return()
-    
-    # Retrieve data from Yahoo API for 90 days
-    getSymbols(symbol, src = "yahoo", from = Sys.Date()-90, to = Sys.Date())
-    
-    data_xts <- get(symbol)
-    # Store for candlestick
-    candlestick_xts(tail(data_xts, 60))
-    
-    open_price <- Op(data_xts)
-    close_price <- Cl(data_xts)
-    timestamp <- index(data_xts)
-    
-    # Feature engineering
-    MA_seven <- SMA(open_price, n = 7)
-    MA_fourteen <- SMA(open_price, n = 14)
-    MA_twenty <- SMA(open_price, n = 20)
-    SD_seven <- runSD(open_price, n = 7)
-    SD_fourteen <- runSD(open_price, n = 14)
-    SD_twenty <- runSD(open_price, n = 20)
-    
-    # Create data frame with calculated features
-    latest_opening <- data.frame(
-      timestamp = as.character(timestamp),
-      open = as.numeric(open_price),
-      close = as.numeric(close_price),
-      MA_seven = as.numeric(MA_seven),
-      MA_fourteen = as.numeric(MA_fourteen),
-      MA_twenty = as.numeric(MA_twenty),
-      SD_seven = as.numeric(SD_seven),
-      SD_fourteen = as.numeric(SD_fourteen),
-      SD_twenty = as.numeric(SD_twenty)
-    )
-    
-    # Drop NA values (MAs introduce NAs at the start)
-    latest_opening <- na.omit(latest_opening)
-    
-    # Select the latest 30 dates for evaluation and prediction
-    latest_opening <- tail(latest_opening, 30)
-    colnames(latest_opening) <- c("timestamp", "open", "close", "MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")
-    
-    # Load the saved model weights for XGBoost from models folder
-    xgb_model_file <- paste0("models/", symbol, "_XGB.rds")
-    latest_opening$predicted_close <- NA
-    
-    if (file.exists(xgb_model_file)) {
-      model <- readRDS(xgb_model_file)
-      
-      # We predict the entire 30-day window to evaluate performance
-      X_pred <- as.matrix(latest_opening[, c("MA_seven", "MA_fourteen", "MA_twenty", "SD_seven", "SD_fourteen", "SD_twenty")])
-      preds <- predict(model, newdata = X_pred)
-      
-      # Shift predictions: preds[i] is the prediction for day i+1
-      latest_opening$predicted_close[2:nrow(latest_opening)] <- preds[1:(length(preds)-1)]
-      
-      # The very last prediction (preds[30]) is for TOMORROW
-      last_date <- as.Date(latest_opening$timestamp[nrow(latest_opening)])
-      next_date <- last_date + 1
-      if(wday(next_date) == 7) next_date <- next_date + 2 # skip saturday
-      if(wday(next_date) == 1) next_date <- next_date + 1 # skip sunday
-      
-      future_row <- data.frame(
-        timestamp = as.character(next_date),
-        open = NA, close = NA,
-        MA_seven = NA, MA_fourteen = NA, MA_twenty = NA,
-        SD_seven = NA, SD_fourteen = NA, SD_twenty = NA,
-        predicted_close = preds[length(preds)]
-      )
-      latest_opening <- rbind(latest_opening, future_row)
-      
-      # === CALCULATE METRICS (Vectorized for DB) ===
-      prev_close <- dplyr::lag(latest_opening$close, 1)
-      
-      # 1. Daily Return
-      latest_opening$actual_return <- (latest_opening$close - prev_close) / prev_close * 100
-      
-      # 2. Errors
-      latest_opening$error_val <- abs(latest_opening$predicted_close - latest_opening$close)
-      latest_opening$error_pct <- (latest_opening$error_val / latest_opening$close) * 100
-      
-      # 3. Signals (Only if previous close exists and predicted close exists)
-      latest_opening$pred_signal <- ifelse(!is.na(latest_opening$predicted_close) & !is.na(prev_close),
-                                           ifelse(latest_opening$predicted_close > prev_close, "Up", "Down"), 
-                                           NA)
-      
-      latest_opening$actual_signal <- ifelse(!is.na(latest_opening$close) & !is.na(prev_close),
-                                             ifelse(latest_opening$close > prev_close, "Up", "Down"), 
-                                             NA)
-      
-      # 4. Correct/Incorrect Verdict (Fixing the absent prediction bug!)
-      latest_opening$correct <- ifelse(!is.na(latest_opening$pred_signal) & !is.na(latest_opening$actual_signal),
-                                       ifelse(latest_opening$pred_signal == latest_opening$actual_signal, "✅", "❌"),
-                                       "⏳")
-      
-      # 5. Cumulative Profit Strategy
-      # If predicted Up, we gain/lose the actual return. If Down, we short.
-      strategy_return <- ifelse(latest_opening$pred_signal == "Up", latest_opening$actual_return, -latest_opening$actual_return)
-      strategy_return[is.na(strategy_return)] <- 0
-      latest_opening$cum_profit_pct <- cumsum(strategy_return)
-      
-      # Compute totals for value boxes
-      metrics_data$profit <- round(tail(latest_opening$cum_profit_pct, 1), 2)
-      metrics_data$accurate <- sum(latest_opening$correct == "✅", na.rm = TRUE)
-      metrics_data$inaccurate <- sum(latest_opening$correct == "❌", na.rm = TRUE)
-      
-      # Additional new metrics
-      total_completed <- metrics_data$accurate + metrics_data$inaccurate
-      metrics_data$win_rate <- ifelse(total_completed > 0, round((metrics_data$accurate / total_completed) * 100, 2), 0)
-      strat_executed <- strategy_return[latest_opening$correct %in% c("✅", "❌")]
-      metrics_data$avg_profit <- if(length(strat_executed) > 0) round(mean(strat_executed, na.rm = TRUE), 2) else 0
-      metrics_data$pending <- sum(latest_opening$correct == "⏳", na.rm = TRUE)
-    }
-    
-    # Upsert the entire 30-day block (and tomorrow's future prediction) to the cloud
-    con <- get_db_connection()
-    if (!is.null(con)) {
-      table_name <- paste0(symbol, "_predictions")
-      
-      # Alter table if it already exists to add the new columns (Ignore error if they exist)
-      tryCatch({
-        DBI::dbExecute(con, sprintf("ALTER TABLE %s ADD COLUMN actual_return NUMERIC, ADD COLUMN error_val NUMERIC, ADD COLUMN error_pct NUMERIC, ADD COLUMN pred_signal TEXT, ADD COLUMN actual_signal TEXT, ADD COLUMN correct TEXT, ADD COLUMN cum_profit_pct NUMERIC;", table_name))
-      }, error = function(e) {})
-      
-      # Ensure the table exists with timestamp as PRIMARY KEY for UPSERT support
-      query_create <- sprintf("
-        CREATE TABLE IF NOT EXISTS %s (
-          timestamp TEXT PRIMARY KEY,
-          open NUMERIC,
-          close NUMERIC,
-          \"MA_seven\" NUMERIC,
-          \"MA_fourteen\" NUMERIC,
-          \"MA_twenty\" NUMERIC,
-          \"SD_seven\" NUMERIC,
-          \"SD_fourteen\" NUMERIC,
-          \"SD_twenty\" NUMERIC,
-          predicted_close NUMERIC,
-          actual_return NUMERIC,
-          error_val NUMERIC,
-          error_pct NUMERIC,
-          pred_signal TEXT,
-          actual_signal TEXT,
-          correct TEXT,
-          cum_profit_pct NUMERIC
-        );
-      ", table_name)
-      tryCatch({ DBI::dbExecute(con, query_create) }, error = function(e) {})
-      
-      # UPSERT Loop
-      # We UPSERT all 31 recent days so the database always has a full 30-day historical log table.
-      # This updates yesterday's NULL close and inserts tomorrow's prediction.
-      recent_opening <- latest_opening
-      for(i in 1:nrow(recent_opening)) {
-        # Using COALESCE on predicted_close ensures we NEVER overwrite an older historical prediction
-        # with a new prediction, preserving the true historical backtest log perfectly!
-        query_upsert <- sprintf("
-          INSERT INTO %s (timestamp, open, close, \"MA_seven\", \"MA_fourteen\", \"MA_twenty\", \"SD_seven\", \"SD_fourteen\", \"SD_twenty\", predicted_close, actual_return, error_val, error_pct, pred_signal, actual_signal, correct, cum_profit_pct)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-          ON CONFLICT (timestamp) DO UPDATE SET
-          open = EXCLUDED.open,
-          close = EXCLUDED.close,
-          \"MA_seven\" = EXCLUDED.\"MA_seven\",
-          \"MA_fourteen\" = EXCLUDED.\"MA_fourteen\",
-          \"MA_twenty\" = EXCLUDED.\"MA_twenty\",
-          \"SD_seven\" = EXCLUDED.\"SD_seven\",
-          \"SD_fourteen\" = EXCLUDED.\"SD_fourteen\",
-          \"SD_twenty\" = EXCLUDED.\"SD_twenty\",
-          predicted_close = COALESCE(%s.predicted_close, EXCLUDED.predicted_close),
-          actual_return = EXCLUDED.actual_return,
-          error_val = EXCLUDED.error_val,
-          error_pct = EXCLUDED.error_pct,
-          pred_signal = EXCLUDED.pred_signal,
-          actual_signal = EXCLUDED.actual_signal,
-          correct = EXCLUDED.correct,
-          cum_profit_pct = EXCLUDED.cum_profit_pct;
-        ", table_name, table_name)
-        
-        tryCatch({
-          DBI::dbExecute(con, query_upsert, params = list(
-            recent_opening$timestamp[i],
-            ifelse(is.na(recent_opening$open[i]), NA, recent_opening$open[i]),
-            ifelse(is.na(recent_opening$close[i]), NA, recent_opening$close[i]),
-            ifelse(is.na(recent_opening$MA_seven[i]), NA, recent_opening$MA_seven[i]),
-            ifelse(is.na(recent_opening$MA_fourteen[i]), NA, recent_opening$MA_fourteen[i]),
-            ifelse(is.na(recent_opening$MA_twenty[i]), NA, recent_opening$MA_twenty[i]),
-            ifelse(is.na(recent_opening$SD_seven[i]), NA, recent_opening$SD_seven[i]),
-            ifelse(is.na(recent_opening$SD_fourteen[i]), NA, recent_opening$SD_fourteen[i]),
-            ifelse(is.na(recent_opening$SD_twenty[i]), NA, recent_opening$SD_twenty[i]),
-            ifelse(is.na(recent_opening$predicted_close[i]), NA, recent_opening$predicted_close[i]),
-            ifelse(is.na(recent_opening$actual_return[i]), NA, recent_opening$actual_return[i]),
-            ifelse(is.na(recent_opening$error_val[i]), NA, recent_opening$error_val[i]),
-            ifelse(is.na(recent_opening$error_pct[i]), NA, recent_opening$error_pct[i]),
-            ifelse(is.na(recent_opening$pred_signal[i]), NA, recent_opening$pred_signal[i]),
-            ifelse(is.na(recent_opening$actual_signal[i]), NA, recent_opening$actual_signal[i]),
-            ifelse(is.na(recent_opening$correct[i]), NA, recent_opening$correct[i]),
-            ifelse(is.na(recent_opening$cum_profit_pct[i]), NA, recent_opening$cum_profit_pct[i])
-          ))
-        }, error = function(e) {})
-      }
-      DBI::dbDisconnect(con)
-    }
-    
-    # Convert timestamp back to Date for plotting
-    latest_opening$timestamp <- as.Date(latest_opening$timestamp)
-    stocks_data[[symbol]] <- latest_opening
-  }
-  
-  # Background Sync: STRICTLY only runs once every 12 hours globally, never on page refresh
+  # Background Sync: Runs purely in a background process, never freezing the UI
   observe({
-    invalidateLater(43200000, session)
+    invalidateLater(3600000, session) # Check every hour instead of every 12 hours
     
-    # Check if 12 hours have passed since the LAST global sync (using 11.9 to be safe with execution times)
-    time_since_sync <- as.numeric(difftime(Sys.time(), global_last_sync, units = "hours"))
+    current_time_est <- with_tz(Sys.time(), tzone = "America/New_York")
     
-    if (time_since_sync > 11.9) {
-      global_last_sync <<- Sys.time() # Instantly lock it so other users/refreshes don't trigger it
+    # The "market day" we are trying to sync
+    # If it's past 6 PM EST, we can sync today's data.
+    # If it's before 6 PM EST, we only sync yesterday's data (if it was missed).
+    target_sync_date <- as.Date(current_time_est)
+    if (hour(current_time_est) < 18) {
+      target_sync_date <- target_sync_date - 1
+    }
+    
+    if (target_sync_date > global_last_sync_date) {
+      global_last_sync_date <<- target_sync_date # Lock it for this market day
       
-      symbols_list <- c("AAPL", "AMZN", "NVDA", "GOOGL", "MSFT")
-      withProgress(message = 'Syncing Live Markets to Cloud...', value = 0, {
-        for(i in seq_along(symbols_list)) {
-          sym <- symbols_list[i]
-          incProgress(1/length(symbols_list), detail = paste("Processing", sym))
-          tryCatch({ retrieveData(sym) }, error = function(e) {})
-        }
-      })
-      
-      # Reload the UI with the fresh data
-      loadDataForUI(input$global_symbol)
+      # Launch the sync script in a completely separate background R process.
+      # wait = FALSE means the Shiny app immediately continues without waiting!
+      system2("Rscript", args = c("scripts/sync_data.R"), wait = FALSE)
     }
   })
   
@@ -447,25 +237,41 @@ server <- function(input, output, session){
     )
     company_name <- company_names[[symbol]]
     
+    sync_time <- last_sync_time()
+    sync_text <- ""
+    if (!is.null(sync_time)) {
+      sync_est <- with_tz(sync_time, tzone = "America/New_York")
+      hours_ago <- round(as.numeric(difftime(Sys.time(), sync_time, units="hours")), 1)
+      sync_text <- paste0("  |  Last Synced: ", format(sync_est, "%Y-%m-%d %I:%M %p %Z"), " (", hours_ago, " hours ago)")
+    }
+    
     div(style = "padding-bottom: 20px;",
         h2(strong(paste0(company_name, " (", symbol, ")")), style = "margin-top: 0px;"),
-        h4(paste0("Current Price: $", latest_price, "  |  As of: ", latest_date), style = "color: #555;")
+        h4(paste0("Current Price: $", latest_price, "  |  As of: ", latest_date, sync_text), style = "color: #555;")
     )
   })
   
   # === METRICS UI ===
   output$profit_box <- renderValueBox({
+    stock_data <- stocks_data[[input$global_symbol]]
+    if (is.null(stock_data)) return(valueBox("0%", "30-Day Cumulative Profit (Strategy)", icon = icon("piggy-bank"), color = "blue"))
+    
+    strat_executed <- stock_data$actual_return[!is.na(stock_data$pred_signal) & !is.na(stock_data$actual_signal)]
+    profit <- if(length(strat_executed) > 0) round(sum(strat_executed, na.rm = TRUE), 2) else 0
+    
     valueBox(
-      paste0(metrics_data$profit, "%"),
+      paste0(profit, "%"),
       "30-Day Cumulative Profit (Strategy)",
       icon = icon("piggy-bank"),
-      color = if(metrics_data$profit >= 0) "green" else "red"
+      color = if(profit >= 0) "green" else "red"
     )
   })
   
   output$accurate_box <- renderValueBox({
+    stock_data <- stocks_data[[input$global_symbol]]
+    acc <- if(!is.null(stock_data)) sum(stock_data$pred_signal == stock_data$actual_signal & !is.na(stock_data$actual_signal), na.rm = TRUE) else 0
     valueBox(
-      metrics_data$accurate,
+      acc,
       "Accurate Predictions",
       icon = icon("thumbs-up"),
       color = "green"
@@ -473,8 +279,10 @@ server <- function(input, output, session){
   })
   
   output$inaccurate_box <- renderValueBox({
+    stock_data <- stocks_data[[input$global_symbol]]
+    inacc <- if(!is.null(stock_data)) sum(stock_data$pred_signal != stock_data$actual_signal & !is.na(stock_data$actual_signal), na.rm = TRUE) else 0
     valueBox(
-      metrics_data$inaccurate,
+      inacc,
       "Inaccurate Predictions",
       icon = icon("thumbs-down"),
       color = "red"
@@ -482,8 +290,16 @@ server <- function(input, output, session){
   })
   
   output$win_rate_box <- renderValueBox({
+    stock_data <- stocks_data[[input$global_symbol]]
+    if (is.null(stock_data)) return(valueBox("0%", "Model Win Rate", icon = icon("percent"), color = "purple"))
+    
+    acc <- sum(stock_data$pred_signal == stock_data$actual_signal & !is.na(stock_data$actual_signal), na.rm = TRUE)
+    inacc <- sum(stock_data$pred_signal != stock_data$actual_signal & !is.na(stock_data$actual_signal), na.rm = TRUE)
+    total_resolved <- acc + inacc
+    win_rate <- if(total_resolved > 0) round((acc / total_resolved) * 100, 1) else 0
+    
     valueBox(
-      paste0(metrics_data$win_rate, "%"),
+      paste0(win_rate, "%"),
       "Model Win Rate",
       icon = icon("percent"),
       color = "purple"
@@ -491,8 +307,14 @@ server <- function(input, output, session){
   })
   
   output$avg_profit_box <- renderValueBox({
+    stock_data <- stocks_data[[input$global_symbol]]
+    if (is.null(stock_data)) return(valueBox("0%", "Avg Daily Strategy Return", icon = icon("chart-line"), color = "aqua"))
+    
+    strat_executed <- stock_data$actual_return[!is.na(stock_data$pred_signal) & !is.na(stock_data$actual_signal)]
+    avg_profit <- if(length(strat_executed) > 0) round(mean(strat_executed, na.rm = TRUE), 2) else 0
+    
     valueBox(
-      paste0(metrics_data$avg_profit, "%"),
+      paste0(avg_profit, "%"),
       "Avg Daily Strategy Return",
       icon = icon("chart-line"),
       color = "aqua"
@@ -500,10 +322,12 @@ server <- function(input, output, session){
   })
   
   output$pending_box <- renderValueBox({
+    stock_data <- stocks_data[[input$global_symbol]]
+    pend <- if(!is.null(stock_data)) sum(!is.na(stock_data$pred_signal) & is.na(stock_data$actual_signal), na.rm = TRUE) else 0
     valueBox(
-      metrics_data$pending,
-      "Pending Future Predictions",
-      icon = icon("hourglass-half"),
+      pend,
+      "Pending Results",
+      icon = icon("clock"),
       color = "yellow"
     )
   })
@@ -559,28 +383,10 @@ server <- function(input, output, session){
   })
   
   # === TABLES ===
-  # Displays data from Supabase backend directly on the dashboard
-  output$stock_table <- renderDataTable({
-    con <- get_db_connection()
-    if (!is.null(con)) {
-      # Use a subquery to fetch only the 31 most recent days
-      query <- sprintf("SELECT timestamp, open, close, predicted_close, actual_return, error_val, error_pct, pred_signal, actual_signal, correct, cum_profit_pct FROM (SELECT * FROM %s_predictions ORDER BY timestamp DESC LIMIT 31) sub ORDER BY timestamp ASC", input$global_symbol)
-      tryCatch({
-        stock_data <- DBI::dbGetQuery(con, query)
-        DBI::dbDisconnect(con)
-      }, error = function(e) { 
-        DBI::dbDisconnect(con) 
-        stock_data <- NULL
-      })
-    } else {
-      stock_data <- NULL
-    }
-    
-    # Fallback if DB disconnected
-    if(is.null(stock_data)) {
-      stock_data <- stocks_data[[input$global_symbol]]
-      if(is.null(stock_data)) return()
-    }
+  # Displays data from the unified reactive data source directly on the dashboard
+  output$stock_table <- DT::renderDataTable({
+    stock_data <- stocks_data[[input$global_symbol]]
+    if(is.null(stock_data)) return()
     
     # Formatting the dataframe perfectly to match your request
     formatted_data <- data.frame(
@@ -591,9 +397,9 @@ server <- function(input, output, session){
       `Daily Profit %` = ifelse(is.na(stock_data$actual_return), "", sprintf("%.2f%%", stock_data$actual_return)),
       Error = ifelse(is.na(stock_data$error_val), "", sprintf("%.2f", stock_data$error_val)),
       `Error %` = ifelse(is.na(stock_data$error_pct), "", sprintf("%.2f%%", stock_data$error_pct)),
-      `Pred Signal` = ifelse(is.na(stock_data$pred_signal), "", stock_data$pred_signal),
-      `Actual Signal` = ifelse(is.na(stock_data$actual_signal), "", stock_data$actual_signal),
-      Correct = ifelse(is.na(stock_data$correct), "", stock_data$correct),
+      `Pred Signal` = as.factor(ifelse(is.na(stock_data$pred_signal), "", stock_data$pred_signal)),
+      `Actual Signal` = as.factor(ifelse(is.na(stock_data$actual_signal), "", stock_data$actual_signal)),
+      Correct = as.factor(ifelse(is.na(stock_data$correct), "", stock_data$correct)),
       `Cum. Profit %` = ifelse(is.na(stock_data$cum_profit_pct), "", sprintf("%.2f%%", stock_data$cum_profit_pct)),
       stringsAsFactors = FALSE,
       check.names = FALSE
@@ -603,7 +409,7 @@ server <- function(input, output, session){
     formatted_data <- formatted_data[order(as.Date(formatted_data$Date), decreasing = TRUE), ]
     
     formatted_data
-  }, options = list(pageLength = 15, scrollX = TRUE))
+  }, filter = "top", extensions = "FixedColumns", options = list(pageLength = 15, scrollX = TRUE, fixedColumns = list(leftColumns = 1)))
   
   # === BACKTESTER SERVER LOGIC ===
   # Update the minimum allowable date based on the specific stock's IPO + 90 days
@@ -722,13 +528,13 @@ server <- function(input, output, session){
   output$bt_accurate_box <- renderValueBox({
     res <- bt_results()
     if(is.null(res)) return(valueBox(0, "Accurate Predictions", icon=icon("thumbs-up"), color="green"))
-    valueBox(sum(res$correct == "✅", na.rm=TRUE), "Accurate Predictions", icon=icon("thumbs-up"), color="green")
+    valueBox(sum(res$pred_signal == res$actual_signal & !is.na(res$actual_signal), na.rm=TRUE), "Accurate Predictions", icon=icon("thumbs-up"), color="green")
   })
   
   output$bt_inaccurate_box <- renderValueBox({
     res <- bt_results()
     if(is.null(res)) return(valueBox(0, "Inaccurate Predictions", icon=icon("thumbs-down"), color="red"))
-    valueBox(sum(res$correct == "❌", na.rm=TRUE), "Inaccurate Predictions", icon=icon("thumbs-down"), color="red")
+    valueBox(sum(res$pred_signal != res$actual_signal & !is.na(res$actual_signal), na.rm=TRUE), "Inaccurate Predictions", icon=icon("thumbs-down"), color="red")
   })
   
   output$bt_stock_plot <- renderPlotly({
@@ -766,7 +572,7 @@ server <- function(input, output, session){
       layout(xaxis = list(rangeslider = list(visible = F)), yaxis = list(title = "Price"))
   })
   
-  output$bt_table <- renderDataTable({
+  output$bt_table <- DT::renderDataTable({
     res <- bt_results()
     if(is.null(res)) return(NULL)
     
@@ -778,16 +584,16 @@ server <- function(input, output, session){
       `Daily Profit %` = ifelse(is.na(res$actual_return), "", sprintf("%.2f%%", res$actual_return)),
       Error = ifelse(is.na(res$error_val), "", sprintf("%.2f", res$error_val)),
       `Error %` = ifelse(is.na(res$error_pct), "", sprintf("%.2f%%", res$error_pct)),
-      `Pred Signal` = ifelse(is.na(res$pred_signal), "", res$pred_signal),
-      `Actual Signal` = ifelse(is.na(res$actual_signal), "", res$actual_signal),
-      Correct = ifelse(is.na(res$correct), "", res$correct),
+      `Pred Signal` = as.factor(ifelse(is.na(res$pred_signal), "", res$pred_signal)),
+      `Actual Signal` = as.factor(ifelse(is.na(res$actual_signal), "", res$actual_signal)),
+      Correct = as.factor(ifelse(is.na(res$correct), "", res$correct)),
       `Cum. Profit %` = ifelse(is.na(res$cum_profit_pct), "", sprintf("%.2f%%", res$cum_profit_pct)),
       stringsAsFactors = FALSE,
       check.names = FALSE
     )
     formatted_data <- formatted_data[order(as.Date(formatted_data$Date), decreasing = TRUE), ]
     formatted_data
-  }, options = list(pageLength = 15, scrollX = TRUE))
+  }, filter = "top", extensions = "FixedColumns", options = list(pageLength = 15, scrollX = TRUE, fixedColumns = list(leftColumns = 1)))
   
   # Download Handlers
   output$download_predictions <- downloadHandler(
