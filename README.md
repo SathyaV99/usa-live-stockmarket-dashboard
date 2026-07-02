@@ -89,6 +89,8 @@ The dashboard operates on a dynamic multi-tab interface:
 - **Macro Trend Chart (60 Days)**: A classic Candlestick chart to provide visual context on recent momentum.
 - **Neon Cloud Logging**: The app connects directly to Neon, generating 5 dedicated tables (e.g., `AAPL_predictions`). It runs an intelligent PostgreSQL `UPSERT` script to update today's actual close price while **strictly preserving** the historical prediction exactness via a `COALESCE` lock.
 
+<img width="600" height="400" alt="image" src="https://github.com/user-attachments/assets/5931771f-e377-48ce-882d-8f69a7f545ec" />
+
 ### Tab 2: Historical Backtester (Sandbox)
 - **Walk-Forward ML Engine**: Replicates the Live Monitoring logic perfectly in history. The sandbox loops over your 15-day test window and dynamically trains a custom, temporary XGBoost model for *every single day* using the exact 30 days of data strictly prior to that specific day.
 - **Dynamic Timeline Protection**: The UI automatically computes the exact IPO date of the selected company, preventing users from selecting backtest dates that lack sufficient historical data.
