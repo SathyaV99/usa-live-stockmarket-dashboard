@@ -17,10 +17,64 @@ It features a dual-architecture system:
 
 The repository is structured for production-grade reliability:
 - `models/`: Stores the compiled XGBoost AI brains (`_XGB.rds`).
-- `scripts/`: Development scripts (`train_advanced_models.R`, `test_db.R`).
+- `scripts/`: Development scripts and background sync processes (e.g., `sync_data.R`).
 - `config/`: Secure, git-ignored configuration files (`credentials.R`, `shinyapps_auth.R`).
 - `data/`: CSV data dumps.
 - `app.R`: The core Shiny dashboard engine.
+
+---
+
+## 🏗️ System Architecture & Data Flow
+
+The application follows a robust decoupled architecture, integrating a responsive frontend, a machine learning backend, and a cloud-native database.
+
+```mermaid
+flowchart TD
+    User((User)) <-->|Interacts| UI[Shiny Dashboard UI]
+    
+    subgraph Live [Live Monitoring Pipeline]
+        Worker[Background Sync Worker] -->|Fetches Live Data| YF1[(Yahoo Finance)]
+        Worker -->|Pre-processing| FE1[Feature Engineering]
+        FE1 -->|Inference| Model1{XGBoost Model}
+        Model1 -->|UPSERT Predictions| DB[(Neon PostgreSQL)]
+    end
+    
+    subgraph Backtester [Historical Backtester Pipeline]
+        Sandbox[Backtester Module] -->|Fetches Historical Data| YF2[(Yahoo Finance)]
+        YF2 -->|Isolates in| Mem[(Local Memory)]
+        Mem -->|Walk-Forward Loop| Loop[Sliding 30-Day Window]
+        Loop -->|Trains| Model2{Temp XGBoost Model}
+        Model2 -->|Evaluates| Eval[Strategy Profit/Loss]
+    end
+    
+    DB -->|Fast Read| UI
+    Eval -->|Renders| UI
+    
+    %% Triggers
+    Clock((Hourly Trigger)) -.->|Spawns| Worker
+    UI -.->|Custom Dates| Sandbox
+```
+
+### 1. System Architecture
+- **Frontend (Shiny UI)**: Built with `shinydashboard` and `plotly`, providing a dual-tab interface for interactive visualization and real-time KPI tracking.
+- **Backend ML Engine**: R-based data pipeline handling real-time data fetching (`quantmod`), feature engineering, and inference (`xgboost`). 
+- **Cloud Database (Neon PostgreSQL)**: Acts as the central source of truth for persistent prediction logging. The UI reads pre-calculated metrics directly from Neon for blazing-fast load times.
+- **Background Workers**: The Shiny app spawns asynchronous background R processes (e.g., `scripts/sync_data.R`) for heavy database synchronization, ensuring the main UI thread never freezes.
+
+### 2. Data Flow (Live Monitoring)
+1. **Trigger**: An asynchronous observer (`invalidateLater(3600000)`) polls hourly to check if the current market day requires a sync.
+2. **Data Ingestion**: A background script queries the Yahoo Finance API for the latest stock prices.
+3. **Feature Engineering**: Calculates 7, 14, and 20-day Moving Averages and Standard Deviations on the fly.
+4. **AI Inference**: Loads the pre-trained `_XGB.rds` models and passes today's features to predict tomorrow's closing price.
+5. **Cloud Upsert**: Performs an intelligent PostgreSQL `UPSERT` to the Neon database. It safely logs tomorrow's prediction while simultaneously updating today's *actual* closing price to evaluate past predictions.
+6. **UI Render**: The dashboard reads the fresh predictions from Neon and instantly renders the Plotly charts, KPIs, and DataTables.
+
+### 3. Data Flow (Historical Backtester)
+1. **Sandbox Setup**: The user selects a custom date range. The system immediately isolates the data flow, bypassing the Neon cloud database to guarantee zero contamination of live tracking.
+2. **Data Ingestion**: Pulls historical data directly from Yahoo Finance into localized server memory.
+3. **Walk-Forward ML Pipeline**: Iterates sequentially through the test window. For *every single day* in the backtest, it dynamically trains a temporary, isolated XGBoost model using strictly the 30 days prior.
+4. **Evaluation**: Predicts the target close, shifts the prediction forward by one day (`t+1`), and calculates simulated profit metrics.
+5. **UI Render**: Updates the Sandbox UI tab with independent visualization widgets and performance logs.
 
 ---
 
